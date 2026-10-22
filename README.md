@@ -1,3 +1,6 @@
+CVE-2026-109618 — post_bytes_processed stale pointer (session.c:3292)
+CVE-2026-109619 — current_file_bytes_processed stale pointer (session.c:3318)
+
 Usage
 ```
 python3 poc.py <url> <command> [OPTIONS]
