@@ -4,6 +4,8 @@
 
 Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution against stock Apache + mod_php deployments. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
 
+I take no credit for creation of the pocs. Just thought they would be good to have in one place.
+
 | | |
 |---|---|
 | **CVE-2026-109618** | `post_bytes_processed` stale pointer -- hash-table insertion increments counters before allocation completes; OOM during `php_url_encode()` in `END` cleanup leaves an uninitialized bucket that `php_session_flush()` treats as a valid `zend_string` |
