@@ -2,6 +2,8 @@
 
 **Remote Code Execution via PHP Session Handler Stale Pointer**
 
+I take no credit for the creation of these POCs. Just thought it would be good to have them in one place.
+
 Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution against stock Apache + mod_php deployments. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
 
 | | |
@@ -267,7 +269,6 @@ alert http $HOME_NET any -> any any (msg:"php2shell - Oversized Set-Cookie PHPSE
 - **Original research**: [Ahmed Sultan](https://github.com/Syrex1013) ([@0x4148](https://x.com/0x4148)) -- vulnerability discovery and initial exploit
 - **Working upstream PoC**: [9bie](https://github.com/9bie/php2shell-bypass-aslr-exp) -- full ASLR bypass chain, chunked TE bypass, production-config exploit
 - **Detection rules**: [ikow](https://github.com/ikow/php2shell-poc) -- Sigma, Suricata, and ModSecurity detection rules
-- **This repo**: [struttonpigeon](https://github.com/struttonpigeon) -- PoC packaging, session poisoning variant, lab documentation
 
 ## References
 
