@@ -16,6 +16,10 @@ BN=${BN:-0}
 BNAME=${BNAME:-10}
 
 # 1) fresh worker + A1
+if [ ! -x "$HERE/run_a1_probe.sh" ]; then
+    echo "error: $HERE/run_a1_probe.sh not found (not vendored; see 9bie/php2shell-bypass-aslr-exp)" >&2
+    exit 1
+fi
 F128=14 BIG=78 BURN=20 PROG_LEN=4000 "$HERE/run_a1_probe.sh" >/tmp/a1w.log 2>&1
 A1URL=$(grep -m1 '^URLPS' /tmp/a1w.log)
 echo "A1: $A1URL"
