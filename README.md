@@ -439,7 +439,14 @@ Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-
 | `pure/extract_offsets.sh`, `selftest.sh`, `.gitignore` | Original to this repo — lab tooling |
 | `README.md`, `LICENSE` | Original packaging; GPL-3.0 applies to this repo's original files (the upstream vendored code carries no explicit license — the upstream repo is the authoritative source) |
 
-Local divergence from upstream (kept minimal and deliberate): `phppoc2.py` adds a `--host` flag (default `127.0.0.1`) threaded through to the helpers, and `pure/pwn_pure.py` points at `phppoc2.py` instead of upstream's `exploit.py` filename.
+Local divergence from upstream (kept minimal and deliberate):
+
+- `phppoc2.py` adds a `--host` flag (default `127.0.0.1`) threaded through to the helpers
+- `phppoc2.py` tries multiple B1 leak-spec layouts per A1 (4 variants with different hole positions/sizes) to improve reliability across ASLR rolls
+- `pure/pwn_pure.py` points at `phppoc2.py` instead of upstream's `exploit.py` filename
+- `phpexploit.py` `try_log_poison()`: fixed unescaped shell metacharacters in the `system()` payload (upstream bug)
+- `pure/decode_cookie.py`, `pure/repro_pure.sh`: widened pointer-range filter to cover both x86_64 and aarch64
+- `pure/watch_md.sh`: added guard for missing `run_a1_probe.sh` dependency
 
 ## Known limitations
 
@@ -448,6 +455,7 @@ Local divergence from upstream (kept minimal and deliberate): `phppoc2.py` adds 
 - **`--proof` is read on the runner's machine.** With a remote `--host`, either share the `/out` volume or use an out-of-band `--cmd` (e.g. a callback request) instead of the default `id>/out/p1`.
 - **`run_pure.sh --dbg`** expects a debug image (`php2shell-dbg:gdb`) built from upstream's `src/` — the PHP source tarball is not vendored here.
 - **`phpexploit.py` needs an inclusion vector** (LFI / logs / FastCGI / PEAR). It is not the CVE chain; `phppoc2.py` is.
+- **Docker Desktop / WSL2 is not a viable lab environment.** The exploit's heap geometry constants were calibrated on native Linux Docker. WSL2's Microsoft custom kernel places the heap above `libphp.so` in the address space (native Linux places it below), which inverts the delta used to calculate `zif_system`. Use native Linux Docker (bare metal, a real VM, or a cloud instance) for lab testing.
 
 ## Verifying the repo works
 
