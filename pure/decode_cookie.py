@@ -10,7 +10,7 @@ dec = urllib.parse.unquote_to_bytes(v.decode("latin1"))
 c = Counter(); first = {}
 for off in range(0, len(dec) - 8, 8):
     q = struct.unpack_from("<Q", dec, off)[0]
-    if 0x7f0000000000 <= q <= 0x7fffffffffff:
+    if 0x7f0000000000 <= q <= 0xffffffffffff:
         b = q & ~0x1fffff
         c[b] += 1; first.setdefault(b, (off, q))
 print("decoded=%d head=%r clusters=%d ptrs=%d" % (

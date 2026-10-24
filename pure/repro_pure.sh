@@ -40,7 +40,7 @@ print("decoded_len=%d head=%r" % (len(dec), dec[:24]))
 c = Counter()
 for off in range(0, len(dec) - 8, 8):
     q = struct.unpack_from("<Q", dec, off)[0]
-    if 0x7f0000000000 <= q <= 0x7fffffffffff:
+    if 0x7f0000000000 <= q <= 0xffffffffffff:
         c[q & ~0x1fffff] += 1
 print("pointer clusters:", [(hex(k), n) for k, n in c.most_common(4)])
 if c:
