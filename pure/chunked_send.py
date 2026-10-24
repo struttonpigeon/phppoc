@@ -42,7 +42,7 @@ def main() -> int:
         s.settimeout(args.timeout)
         try:
             s.sendall(out)
-            while len(resp) < 4 << 20:
+            while len(resp) < 8 << 20:
                 chunk = s.recv(65536)
                 if not chunk:
                     break
