@@ -82,39 +82,74 @@ If you see both of these in close succession, especially multiple times, investi
 - Multipart bodies containing `PHP_SESSION_UPLOAD_PROGRESS`
 - `Set-Cookie: PHPSESSID=` headers larger than 100KB (this is the heap leak -- a normal session cookie is ~60 bytes)
 
-### Sigma rule
+### Sigma rules
+
+Two separate rules — one for access logs (the exploit's HTTP footprint) and one for error logs (OOM/segfault indicators). Adapt field names to your SIEM's log ingestion.
+
+**Access log detection** (chunked POST with session upload progress, repeated from one source):
 
 ```yaml
-title: php2shell Session Upload Progress RCE Attempt
+title: php2shell Session Upload Progress Exploit Traffic
 id: b7c4d8e0-1234-5678-9abc-def012345678
 status: experimental
-description: Detects exploitation of CVE-2026-109618/CVE-2026-109619 via session upload progress handler
+description: >
+    Detects the HTTP footprint of CVE-2026-109618/CVE-2026-109619 exploitation:
+    repeated chunked POST requests containing PHP_SESSION_UPLOAD_PROGRESS from a
+    single source, some returning 500 (OOM trigger) and some returning oversized
+    Set-Cookie headers (heap leak).
 references:
     - https://github.com/9bie/php2shell-bypass-aslr-exp
 logsource:
     category: webserver
     product: apache
 detection:
+    selection_method:
+        cs-method: 'POST'
+    selection_session:
+        cs-uri-query|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
+    selection_chunked:
+        cs-header|contains: 'Transfer-Encoding: chunked'
+    selection_error:
+        sc-status: 500
+    condition: selection_method and selection_session and (selection_chunked or selection_error) | count(cs-uri) by src_ip > 10
+    timeframe: 5m
+falsepositives:
+    - Legitimate large file uploads with session progress tracking and chunked encoding (uncommon)
+level: high
+tags:
+    - attack.initial_access
+    - attack.t1190
+    - cve.2026.109618
+    - cve.2026.109619
+```
+
+**Error log detection** (OOM followed by segfault — the two-line signature in Apache's error log):
+
+```yaml
+title: php2shell OOM and Segfault in Apache Error Log
+id: c8d5e9f1-2345-6789-abcd-ef0123456789
+status: experimental
+description: >
+    Detects repeated PHP out-of-memory errors followed by child segfaults in the
+    Apache error log, which is the server-side signature of the CVE-2026-109618
+    OOM trigger crashing the stale-pointer worker.
+references:
+    - https://github.com/9bie/php2shell-bypass-aslr-exp
+logsource:
+    category: application
+    product: apache
+detection:
     selection_oom:
-        cs-status: 500
-        sc-bytes|gt: 100000
-    selection_error_log:
-        EventData|contains:
+        message|contains|all:
             - 'Allowed memory size of'
             - 'bytes exhausted'
-    selection_session:
-        cs-body|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
-    selection_chunked:
-        cs-header-transfer-encoding: 'chunked'
-        cs-method: 'POST'
-    condition: (selection_oom and selection_session) or
-               (selection_error_log and selection_session) or
-               (selection_chunked and selection_session and selection_oom)
+    selection_segfault:
+        message|contains: 'exit signal Segmentation fault'
+    condition: selection_oom or selection_segfault | count() > 3
     timeframe: 5m
-    count: 10
 falsepositives:
-    - Legitimate large file uploads with session progress tracking (rare to trigger OOM)
-level: high
+    - Legitimate OOM from very large uploads (would not produce repeated segfaults)
+level: critical
 tags:
     - attack.initial_access
     - attack.t1190
@@ -125,21 +160,36 @@ tags:
 ### Suricata rules
 
 ```
+# Rule 1: A1 stage — chunked POST with PHP_SESSION_UPLOAD_PROGRESS (OOM trigger)
 alert http any any -> $HOME_NET any (msg:"php2shell - PHP_SESSION_UPLOAD_PROGRESS with chunked TE";
     flow:to_server,established;
     content:"POST"; http_method;
     content:"PHP_SESSION_UPLOAD_PROGRESS"; http_client_body;
     content:"Transfer-Encoding|3a 20|chunked"; http_header;
+    flowbits:set,php2shell.a1;
     threshold:type both, track by_src, count 50, seconds 30;
     classtype:web-application-attack;
-    sid:2026100; rev:1;)
+    sid:2026100; rev:2;)
 
+# Rule 2: B1 stage — oversized Set-Cookie PHPSESSID (heap leak via stale pointer)
+# Normal PHPSESSID is ~60 bytes; the exploit produces 100KB+ of leaked heap.
 alert http $HOME_NET any -> any any (msg:"php2shell - Oversized Set-Cookie PHPSESSID (heap leak)";
     flow:to_client,established;
+    flowbits:isset,php2shell.a1;
     content:"Set-Cookie|3a 20|PHPSESSID="; http_header;
-    isdataat:100000,relative;
+    isdataat:10000,relative;
     classtype:web-application-attack;
-    sid:2026101; rev:1;)
+    sid:2026101; rev:2;)
+
+# Rule 3: Burst of concurrent POSTs to the same endpoint (worker pinning stage)
+# The exploit holds 149+ partial POST bodies to saturate prefork workers.
+alert http any any -> $HOME_NET any (msg:"php2shell - POST burst (worker pinning)";
+    flow:to_server,established;
+    content:"POST"; http_method;
+    content:"Content-Length|3a 20|1048576"; http_header;
+    threshold:type both, track by_src, count 100, seconds 10;
+    classtype:web-application-attack;
+    sid:2026102; rev:1;)
 ```
 
 ---
