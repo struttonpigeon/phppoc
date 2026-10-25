@@ -512,7 +512,7 @@ Run `./selftest.sh` after cloning — it compiles every Python file, verifies th
 
 ## Requirements
 
-- Python 3.8+ (standard library only — no third-party packages required)
+- Python 3.9+ (standard library only — no third-party packages required)
 - Docker (for lab setup only)
 
 ## Repository layout & provenance
