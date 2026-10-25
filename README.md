@@ -5,6 +5,8 @@
 Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution. The CVEs affect all PHP SAPI modes (mod_php, PHP-FPM, etc.); this repo's exploit tools target stock Apache + mod_php (prefork) deployments specifically. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
 
 When cloning the repo, first thing you do is run ./selftest.sh to ensure nothing is missing or broken.
+Then if applicable, you run ./selftest.sh --docker to boot the vulnerable php:8.4.26-apache container, run the full exploit chain, and check for the proof file. 
+Red teamers are assumed to read the instructions and know what to do.
 
 The point of this repo is to help detect what servers are vulnerable and to provide evidence of working code.
 I take no credit for creation of the PoCs. Just thought they would be good to have in one place, along with detection and remediation guidance.
