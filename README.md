@@ -4,6 +4,7 @@
 
 Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution against stock Apache + mod_php deployments. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
 
+The point of this repo is to help detect what servers are vulnerable and to provide evidence of working code.
 I take no credit for creation of the PoCs. Just thought they would be good to have in one place, along with detection and remediation guidance.
 
 | | |
