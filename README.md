@@ -436,6 +436,7 @@ Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-
 | `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py`) |
 | `pure/RESEARCH_PURE_128M.md`, `pure/*.gdb`, `pure/mk_b_min.py`, `pure/mk_flood.py`, `pure/watch_md.sh`, `pure/repro_pure.sh` | Vendored from 9bie's repo — the heap-recalibration kit for other PHP minor versions |
 | `phpexploit.py` | Original to this repo (session poisoning + LFI companion; see its section above) |
+| `diag_remote.py` | Original to this repo — target-agnostic remote diagnostic (no shell/log access needed) |
 | `pure/extract_offsets.sh`, `selftest.sh`, `.gitignore` | Original to this repo — lab tooling |
 | `README.md`, `LICENSE` | Original packaging; GPL-3.0 applies to this repo's original files (the upstream vendored code carries no explicit license — the upstream repo is the authoritative source) |
 
@@ -447,6 +448,50 @@ Local divergence from upstream (kept minimal and deliberate):
 - `phpexploit.py` `try_log_poison()`: fixed unescaped shell metacharacters in the `system()` payload (upstream bug)
 - `pure/decode_cookie.py`, `pure/repro_pure.sh`: widened pointer-range filter to cover both x86_64 and aarch64
 - `pure/watch_md.sh`: added guard for missing `run_a1_probe.sh` dependency
+
+## Remote diagnostic (diag_remote.py)
+
+A target-agnostic diagnostic tool for probing remote servers **without needing shell access or error logs**. It answers the questions that the Apache error log would normally answer: is this prefork? how many workers? does A1 trigger OOM? does the worker survive?
+
+This is useful when you can reach the target over HTTP but cannot read its logs — run it from your own machine before attempting the full exploit to understand what the target will do.
+
+```bash
+# Probe a remote target
+python3 diag_remote.py --host 192.168.155.10 --port 80
+
+# Probe a local Docker lab
+python3 diag_remote.py --host 127.0.0.1 --port 18110
+
+# Increase probe range for high-capacity servers
+python3 diag_remote.py --host 10.0.0.5 --port 80 --max-probe 500
+```
+
+**What it checks (5 steps):**
+
+| Step | What it does | What it tells you |
+|---|---|---|
+| 1 | Reads `Server` and `X-Powered-By` headers | Confirms Apache + PHP version |
+| 2 | Holds open incremental POST connections until no worker can serve a GET | Confirms prefork MPM and estimates `MaxRequestWorkers` (use this value for `--workers`) |
+| 3 | Releases holders until a worker is free, verifies it responds | Confirms worker pinning works on this target |
+| 4 | Fires the A1 OOM payload (same as the real exploit) | Checks if the server returns 500 (= OOM triggered) |
+| 5 | Sends a session-triggering POST to the same worker | **Key result:** did the worker survive A1? |
+
+**Interpreting step 5:**
+
+| Result | Meaning | Action |
+|---|---|---|
+| Worker alive + Set-Cookie present | Worker survived OOM — exploit should work | Run `phppoc2.py` against this target |
+| Worker alive + oversized Set-Cookie (>10KB) | Stale pointer confirmed — B1 leak will read heap | Exploit is very likely to succeed |
+| Worker NOT responding | Worker crashed (segfault, not OOM bailout) | B1 will always get 0 bytes — the stale pointer is lost. The target's PHP build may handle OOM differently (e.g., `SIGKILL` from cgroup limits, or a stricter allocator). Check if the target has additional memory constraints beyond `memory_limit` |
+| Cannot saturate workers | Server is not prefork, or `MaxRequestWorkers` > `--max-probe` | Increase `--max-probe`, or confirm the target uses prefork MPM |
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | *(required)* | Target host |
+| `--port` | 80 | Target port |
+| `--max-probe` | 300 | Maximum holder connections to try |
 
 ## Known limitations
 
