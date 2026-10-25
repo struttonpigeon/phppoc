@@ -31,6 +31,7 @@ done
 echo "[2/6] entry points"
 if python3 phppoc2.py --help >/dev/null 2>&1; then ok "phppoc2.py --help"; else bad "phppoc2.py --help"; fi
 if python3 phpexploit.py --help >/dev/null 2>&1; then ok "phpexploit.py --help"; else bad "phpexploit.py --help"; fi
+if python3 diag_remote.py --help >/dev/null 2>&1; then ok "diag_remote.py --help"; else bad "diag_remote.py --help"; fi
 
 echo "[3/6] pwn_pure.py alias target"
 ALIAS_TARGET=$(python3 - <<'EOF'

