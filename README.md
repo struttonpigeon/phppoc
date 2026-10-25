@@ -527,9 +527,9 @@ Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-
 
 | File(s) | Origin |
 |---|---|
-| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py`) |
+| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py` with some changess to make it work better) |
 | `pure/RESEARCH_PURE_128M.md`, `pure/*.gdb`, `pure/mk_b_min.py`, `pure/mk_flood.py`, `pure/watch_md.sh`, `pure/repro_pure.sh` | Vendored from 9bie's repo — the heap-recalibration kit for other PHP minor versions |
-| `phpexploit.py` | Original to this repo (session poisoning + LFI companion; see its section above) |
+| `phpexploit.py` | Credit to Ahmed Sultan, there are some minor changes (session poisoning + LFI companion; see its section above) |
 | `diag_remote.py` | Original to this repo — target-agnostic remote diagnostic (no shell/log access needed) |
 | `pure/extract_offsets.sh`, `selftest.sh`, `.gitignore` | Original to this repo — lab tooling |
 | `README.md`, `LICENSE` | Original packaging; GPL-3.0 applies to this repo's original files (the upstream vendored code carries no explicit license — the upstream repo is the authoritative source) |
